@@ -1,0 +1,1094 @@
+#!/usr/bin/perl
+
+use strict;
+use Text::ParseWords;
+use Digest::SHA qw(sha256 sha256_base64);
+
+#==============================================================================#
+#                                o p t i o n s                                 #
+#==============================================================================#
+
+my $DEBUG = 0;
+
+sub Getopts
+   #---------------------------------------------------------------------------#
+   # usage: &Getopts('a:bc@{flag}');                                           #
+   #                                                                           #
+   # Argument describes options as a sequence of option definitions.  Each     #
+   # definition consists of an option letter or a brace-enclosed option word   #
+   # followed by an optional mode character.  The mode may be : for a single-  #
+   # value option ($opt_* is set to the value), @ for a multi-valued option    #
+   # (values are pushed onto @opt_*), or missing for a boolean option ($opt_*  #
+   # is set to 1 if the option appears).                                       #
+   #                                                                           #
+   # An option may also be followed by [suboption,...], in which case the      #
+   # option must be invoked as -option[suboption,...] (no spaces!) or -option. #
+   # In this case, $opt_* is set if any suboption is chosen, and $opt_*{*} is  #
+   # set for each suboption specified.  -option by itself selects all          #
+   # suboptions.                                                               #
+   #                                                                           #
+   # Returns 1 if no errors were encountered.  Error disgnostics are printed   #
+   # to STDERR for each error encountered.                                     #
+   #---------------------------------------------------------------------------#
+{
+   my $argumentative = shift;
+   my (%args,$arg,$mode,$first,$rest);
+   my $errs = 0;
+   my $opt = {};
+
+   while ($argumentative) {
+      $argumentative =~ /\s*(\w|\{\w+\})([:@]|\[[^\]]*\])?(.*)/;
+      ($arg,$mode,$argumentative) = ($1,$2,$3);
+      $arg =~ s/[{}]//g;
+      if ($mode =~ /^\[/) {
+         for my $suboption (split (',', substr ($mode, 1, length ($mode)-2))) {
+            $args{"$arg.$suboption"} = $suboption;
+            print "args{$arg.$suboption} = $suboption\n" if $DEBUG;
+         }
+         $mode = '[';
+      }
+      $args{$arg} = $mode ? $mode : '';
+   }
+
+   while(@ARGV && ($_ = $ARGV[0]) =~ /^-(.)(.*)/) {
+      ($first,$rest) = ($1,$2);
+      my $t = "$first$rest";
+      #--------------------------------#
+      # look for -option[suboptions,,, #
+      #--------------------------------#
+      if ($t =~ /(\w+)(\[.*)/ && $args{$1} eq '[') {
+         $first = $1;
+         $rest  = $2;
+      } elsif(defined $args{$t}) {
+         ($first,$rest) = ($t,'');
+      }
+      if(defined $args{$first}) {
+         if($args{$first} eq '[') {
+            #-------------------------------------#
+            # $first is an option with suboptions #
+            #-------------------------------------#
+            shift(@ARGV);
+            $opt->{$first} = 1;
+            print "\$opt_$first = 1;\n" if $DEBUG;
+            if($rest =~ /^\[/) {
+               #--------------------------------------#
+               # we had -option[suboptions,...]stuff: #
+               #    put "stuff" back on ARGV          #
+               #--------------------------------------#
+               if($rest =~ /^(\[[^\]]*\])(.+)/) {
+                  $rest = $1;
+                  unshift(@ARGV, "-$2");
+               }
+            } elsif($rest eq '' && @ARGV && $ARGV[0] =~ /^\[.*\]$/) {
+               #----------------------------------------------#
+               # we had -option <whitespace> [suboptions,...] #
+               #----------------------------------------------#
+               $rest = shift(@ARGV);
+            }
+            if ($rest) {
+               #---------------------------------#
+               # we had some explicit suboptions #
+               #---------------------------------#
+               $rest =~ s/^\[//;
+               $rest =~ s/\]$//;
+               for my $suboption (split (',', $rest)) {
+                  next unless $suboption;
+                  my @hits = grep (/^$first.$suboption/, keys %args);
+                  if (@hits) {
+                     for my $hit (grep (/^$first.$suboption/, keys %args)) {
+                        $opt->{$first}->{$args{$hit}} = 1;
+                        print "\$opt_$first\{$args{$hit}\} = 1;\n" if $DEBUG;
+                     }
+                  } else {
+                     ++$errs;
+                     print STDERR "Unknown suboption: $first\[$suboption\]\n";
+                  }
+               }
+            } else {
+               #--------------------------------------#
+               # no explicit suboptions: set them all #
+               #--------------------------------------#
+               for my $suboption (grep (/^$first\./, keys %args)) {
+                  $opt->{$first}->{$args{$suboption}} = 1;
+                  print "\$opt_$first\{$args{$suboption}\} = 1;\n" if $DEBUG;
+               }
+            }
+         } elsif($args{$first}) {
+            #------------------------------------------------------#
+            # $first is a single- or multi- valued option (: or @) #
+            #------------------------------------------------------#
+            shift(@ARGV);
+            if($rest eq '') {
+               if (@ARGV) {
+                  $rest = shift(@ARGV);
+               } else {
+                  ++$errs;
+                  print STDERR "Option requires a value: $first\n";
+               }
+            }
+            if ($args{$first} eq '@') {
+               my %rest;
+               push @{$opt->{$first}}, split (/,/, $rest);
+               print "push (\@opt_$first, $rest);\n" if $DEBUG;
+            } else {
+               $opt->{$first} = $rest;
+               print "\$opt_$first = $rest;\n" if $DEBUG;
+            }
+         } else {
+            #----------------------------#
+            # $first is a simple Boolean #
+            #----------------------------#
+            $opt->{$first} = 1;
+            print "\$opt_$first = 1;\n" if $DEBUG;
+            if($rest eq '') {
+               shift(@ARGV);
+            } else {
+               $ARGV[0] = "-$rest";
+            }
+         }
+      } else {
+         print STDERR "Unknown option: $first\n";
+         ++$errs;
+         if($rest ne '') {
+            $ARGV[0] = "-$rest";
+         } else {
+            shift(@ARGV);
+         }
+      }
+   }
+   return if $errs;
+   return $opt;
+}
+
+#==============================================================================#
+#                                c o l u m n s                                 #
+#==============================================================================#
+
+sub column_width
+   #---------------------------------------------------------------------------#
+   # usage: $width = column_width ($string, ...);                              #
+   #                                                                           #
+   # Returns the length of the longest string in the argument list.  Note that #
+   # arguments may be strings or array references of strings (or array of      #
+   # array etc.), and the function recurses into the array refs.               #
+   #---------------------------------------------------------------------------#
+{
+   my $len = 0;
+   for my $i (@_) {
+      my $il = ref $i eq 'ARRAY' ? &column_width (@$i) : length ($i);
+      $len = $il if $il > $len;
+   }
+   return $len;
+}
+
+sub column_print
+   #---------------------------------------------------------------------------#
+   # usage: column_print (ARRAYREF, ARRAYREF, ...)                             #
+   #                                                                           #
+   # Each ARRAYREF is interpreted as a column in the output.  The first entry  #
+   # in each column is its heading: subsequent entries are values.  Entries    #
+   # may be strings or ARRAYREFs of strings, the latter being interpreted as   #
+   # multi-line values.  Prints width-adjusted output on the current output    #
+   # stream as follows:                                                        #
+   #                                                                           #
+   #   heading0          heading1               <- column headings             #
+   #   ----------------- ---------------------  <- automatic separator         #
+   #   value0.1          value1.1               <- string values               #
+   #   value0.2.0        value1.2               <- ARRAYREF on the left        #
+   #   value0.2.1                                                              #
+   #   value0.2.2                                                              #
+   #                     value1.3               <- extra values on the right   #
+   #---------------------------------------------------------------------------#
+{
+   my @widths = map (&column_width (@$_), @_);
+   my $fmt = 'A'.join ('A', map ($_+1, @widths));
+   $fmt =~ s/A\d+$/A*/;   # replace last width with '*'
+   my $n = (sort {$b <=> $a} map (scalar (@$_), @_)) [0];
+   my $nn;
+   my @rc;
+
+   for my $i (0..$n-1) {
+      $nn = (sort {$b <=> $a} map (ref $_->[$i] eq 'ARRAY' ?
+                                      scalar (@{$_->[$i]}) : 1,
+                                   @_)) [0];
+      for my $ii (0..$nn-1) {
+         push @rc, pack ($fmt, map (ref ($_->[$i]) eq 'ARRAY'
+                                    ? $_->[$i]->[$ii]
+                                    : $ii ? '' : $_->[$i], @_));
+      }
+      push @rc, pack ($fmt, map ('-' x $_, @widths)) if $i == 0;
+   }
+
+   return @rc;
+}
+
+#==============================================================================#
+#                      c h e e s y   x m l   p a r s e r                       #
+#==============================================================================#
+
+sub xml_cheese
+{
+    my $fn = shift;
+
+    open my $file, $fn or return;               # slurp $fn into $doc
+    my $doc = join '', <$file>;
+    close $file;
+
+    $doc =~ s/<\?[^>]*\?>[^<>]*//sg;            # discard <?...?>
+    $doc =~ s/<!--.*?-->[^<>]*//sg;             # discard comments
+    my @doc = split />[^<>]*</s, $doc;          # parse into <elements>
+    $doc[0]  =~ s/^[^<>]*<//;                   # ... cleanup first <
+    $doc[-1] =~ s/>[^<>]*$//;                   # ... cleanup last >
+
+    my %doc;
+    my @path;
+    my %array;
+    for my $tok (@doc) {
+        if ($tok =~ m|^/|) {                    # </element>
+            $tok = substr $tok, 1;
+            printf STDERR "warning: /$tok does not match $path[-1]\n"
+                if $path[-1] !~ /^$tok(?:\[\d+\])?$/;
+            pop @path;
+        } else {                                # <element...> or <element.../>
+            my $close = 1 if $tok =~ s|\s*/$||;
+            my @tok = quotewords ('\s+', 0, $tok);
+            my $element = shift @tok;
+            my $path    = join '.', @path, $element;
+            if (defined $array{$path}) {
+                if ($array{$path} == 0) {
+                    my @keys = grep /\Q$path./, keys %doc;
+                    for my $old (@keys) {
+                        my $new = $path . '[0]' . substr ($old, length $path);
+                        $doc{$new} = $doc{$old};
+                        delete $doc{$old};
+                    }
+                    @keys = grep /\Q$path./, keys %array;
+                    for my $old (@keys) {
+                        my $new = $path . '[0]' . substr ($old, length $path);
+                        $array{$new} = $array{$old};
+                        delete $array{$old};
+                    }
+                }
+                $array{$path}++;
+                $element .= "[$array{$path}]";
+                $path    .= "[$array{$path}]";
+            } else {
+                $array{$path} = 0;
+            }
+            for my $attr (@tok) {
+                my ($a, $v) = split /=/, $attr, 2;
+                $doc{"$path.$a"} = $v;
+            }
+            push @path, $element unless $close; # <element.../>
+        }
+    }
+    return \%doc;
+}
+
+sub xml_find
+{
+    my $xml   = shift;
+    my $node  = shift;
+    my $key   = shift;
+    my $value = shift;
+
+    return unless defined $xml;
+    my $found;
+    if (!defined $value) {
+        # find $node[n] but not $node[n].key
+        my %seen;
+        for my $test (keys %$xml) {
+            next unless $test =~ /^(\Q$node\E(?:\[\d+\])?\.)/;
+            next if defined $seen{$1};
+            $seen{$1} = 1;
+            next if grep /^\Q$1$key/, keys %$xml;
+            $found = $1;
+            last;
+        }
+    } else {
+        for my $test (grep /^\Q$node\E(?:\[\d+\])?\.$key/, keys %$xml) {
+            if ($xml->{$test} eq $value) {
+                $found = substr $test, 0, length($test) - length($key);
+                last;
+            }
+        }
+    }
+    if (defined $found) {
+        my %found;
+        for my $match (grep /^\Q$found/, keys %$xml) {
+            $found{substr $match, length $found} = $xml->{$match};
+        }
+        return \%found;
+    }
+    return;
+}
+
+#==============================================================================#
+#                              S T   p a r s e r                               #
+#==============================================================================#
+
+sub krypt
+{
+    my $clear  = shift;
+    my $cipher = shift;
+    if ($cipher =~ /^{SHA-256}(.*)/) {
+        my $digest = $1;
+        if (length $digest > 8 && $digest =~ /=$/) {
+            my $salt = substr $digest, 0, 8;
+            my $hash = sha256_base64($clear.$salt);
+            $hash .= '=' unless $hash =~ /=$/;
+            return 1 if $hash eq substr($digest, 8);
+        } else {
+            return 1 if sha256($clear) eq $digest;
+        }
+    } else {
+        return 1 if crypt ($clear, $cipher) eq $cipher;
+    }
+    return undef;
+}
+
+sub crack
+{
+    my $user = shift;
+    my $pass = shift;
+
+    return 'password'   if krypt ('password',   $pass);
+    return 'p'          if krypt ('p'       ,   $pass);
+    return 'q'          if krypt ('q'       ,   $pass);
+    return 'valicert'   if krypt ('valicert',   $pass);
+    return 'tumbleweed' if krypt ('tumbleweed', $pass);
+    return $user        if krypt ($user     ,   $pass);
+    return '******';
+}
+
+sub st_home
+{
+    my $st = shift;
+    return $st->{home} if defined $st->{home};
+
+    open ENV, "/etc/fd/env.sh$st->{alias}" or return;
+    while (my $line = <ENV>) {
+        chomp $line;
+        $st->{home} = $1, last if $line =~ /^FILEDRIVEHOME="?([^"]*)"?/;
+    }
+    close ENV;
+    return $st->{home};
+}
+
+sub st_readme
+{
+    my $st = shift;
+    return $st->{version} if defined $st->{version};
+
+    if (open README, "$st->{home}/README") {
+        while (<README>) {
+            chomp;
+            my ($k, $v) = split ' ', $_, 2;
+            $st->{sort} = $v, next if $k eq 'sort';
+            push @{$st->{readme}}, {k => $k, v => $v};
+        }
+        close README;
+    }
+    return $st->{readme};
+}
+
+sub st_version
+{
+    my $st = shift;
+    return $st->{version} if defined $st->{version};
+
+    if (open VERSIONS, "$st->{home}/conf/versions.txt") {
+        while (<VERSIONS>) {
+            chomp;
+            my @line = split;
+            if ($line[0] eq 'ST-Core-Server') {
+                $st->{version} = $line[1];
+                $st->{build}   = $line[2];
+                last;
+            }
+        }
+        close VERSIONS;
+        push @{$st->{variant}}, 'EE' if -d "$st->{home}/brules";
+        if ($st->{version} ge '5.2.1' and
+            open (my $display, "$st->{home}/../synInstall/scripts/display")) {
+            while (<$display>) {
+                chomp;
+                my @line = split;
+                next if $line[0] =~ /^#/;
+                if ($line[0] eq 'SecureTransport') {
+                    push @{$st->{variant}}, @line[2..$#line];
+                    map s/,//g, @{$st->{variant}};
+                }
+            }
+            close $display;
+        }
+    } elsif (open VERSIONS, "$st->{home}/conf/version.txt") {
+        chomp (my $version = <VERSIONS>);
+        chomp (my $variant = <VERSIONS>);
+        close VERSIONS;
+        my @line = split ' ', $version;
+        $st->{version} = $line[0];
+        $st->{build}   = $line[1];
+        push @{$st->{variant}}, $variant;
+    } elsif (open STRINGS, "strings $st->{home}/bin/ftpd|") {
+        while (<STRINGS>) {
+            chomp;
+            next unless /^SecureTransport/;
+            chomp ($_ = <STRINGS>);
+            $st->{version} = $_, last if /^\d/;
+        }
+        close STRINGS;
+    }
+    push @{$st->{variant}}, 'Entrust' if -f "$st->{home}/lib/libEntrustGlue.a";
+    return $st->{version};
+}
+
+sub by_level
+{
+    ($a->{level} <=> $b->{level}) || ($a->{user} cmp $b->{user});
+}
+
+sub st_config {
+    my $st = shift;
+    return $st->{config} if defined $st->{config};
+
+    if ($st->{version} ge '5.0') {
+        $st->{config} = {};
+        my $query = 'select name,value '.
+                    'from ConfigurationOption';
+        for my $record (st_mysql ($st, $query)) {
+            my ($name,$value) = split /\t/, $record;
+            $st->{config}->{$name} = $value;
+        }
+    }
+}
+
+sub st_admin
+{
+    my $st = shift;
+    return $st->{admin} if defined $st->{admin};
+
+    if ($st->{version} ge '5.0') {
+        my $query = 'select a.name,password,r.name,a.isLockedOut=(1) '.
+                    'from Administrator a join AdministrativeRole r '.
+                    'on a.administrativeRoleId=r.id';
+        for my $record (st_mysql ($st, $query)) {
+            my ($user,$pass,$level,$locked) = split /\t/, $record;
+            $pass = crack $user, $pass;
+            push @{$st->{admin}},
+                 {user   => $user,
+                  pass   => $pass,
+                  level  => $level,
+                  locked => $locked};
+        }
+    } else {
+        open ADMINS, "$st->{home}/lib/admin/config/passwd" or return;
+        $_ = <ADMINS>;    # discard header line
+        while (<ADMINS>) {
+            s/[\r\n]+$//;  # DOS mode problems on this file
+            my ($user, $pass, $level) = split /:/;
+            $pass = crack $user, $pass;
+            push @{$st->{admin}},
+                 {user => $user, pass => $pass, level => $level};
+        }
+        close ADMINS;
+    }
+    return $st->{admin};
+}
+
+my $iPORTW=1;
+my %PORTW = ('ftp'            => $iPORTW++,   # sort weights for port names
+             'ftp jmx'        => $iPORTW++,
+             'http'           => $iPORTW++,
+             'https'          => $iPORTW++,
+             'http shutdown'  => $iPORTW++,
+             'http jmx'       => $iPORTW++,
+             'as2'            => $iPORTW++,
+             'as2/s'          => $iPORTW++,
+             'as2 shutdown'   => $iPORTW++,
+             'ssh'            => $iPORTW++,
+             'pesit'          => $iPORTW++,
+             'pesit/s'        => $iPORTW++,
+             'pesit ptcp'     => $iPORTW++,
+             'pesit/s ptcp'   => $iPORTW++,
+             'pesit/s cft'    => $iPORTW++,
+             'pesit bounce'   => $iPORTW++,
+             'admin'          => $iPORTW++,
+             'admin servlets' => $iPORTW++,
+             'admin shutdown' => $iPORTW++,
+             'addcert'        => $iPORTW++,
+             'agentd'         => $iPORTW++,
+             'tm'             => $iPORTW++,
+             'tm/s'           => $iPORTW++,
+             'tm jmx'         => $iPORTW++,
+             'tomcat'         => $iPORTW++,
+             'database'       => $iPORTW++,
+             'cluster'        => $iPORTW++,
+             'cluster/s'      => $iPORTW++,
+            );
+my %PORTA = (                  # formats for <a> hrefs
+             'http'    => '<a href="http://<h>:<p>/"><p></a>',
+             'https'   => '<a href="https://<h>:<p>/"><p></a>',
+             'admin'   => '<a href="https://<h>:<p>/"><p></a>',
+             'addcert' => '<a href="http://<h>:<p>/addcert.cgi"><p></a>',
+            );
+sub by_port
+{
+    ($PORTW{$a} || 999) <=> ($PORTW{$b} || 999);
+}
+
+sub port_enabled
+{
+    my $st  = shift;
+    my $port = shift;
+    my $enabled = shift;
+
+    if ($st->{config}->{$enabled} eq 'true') {
+        return $st->{config}->{$port};
+    } else {
+        return "$st->{config}->{$port} (disabled)";
+    }
+}
+
+sub st_port
+{
+    my $st = shift;
+    return $st->{port} if defined $st->{port};
+
+    if ($st->{version} ge '5.0') {
+        $st->{port}->{ftp             } = port_enabled($st, 'Ftp.Port', 'Ftp.Inbound.Listeners.Listener.enable');
+        $st->{port}->{http            } = port_enabled($st, 'HttpPort', 'HttpEnabled');
+        $st->{port}->{https           } = port_enabled($st, 'HttpsPort', 'HttpsEnabled');
+        $st->{port}->{'http shutdown' } = $st->{config}->{'Http.ConfidentialPort'};
+        $st->{port}->{ssh             } = port_enabled($st, 'Ssh.Port', 'Ssh.Enable');
+        $st->{port}->{as2             } = port_enabled($st, 'As2.NonSSL.Listener.Port', 'As2.NonSSL.Listener.Enable');
+        $st->{port}->{'as2/s'         } = port_enabled($st, 'As2.SSL.Listener.Port', 'As2.SSL.Listener.Enable');
+        $st->{port}->{'as2 shutdown'  } = $st->{config}->{'As2.shutdownPort'};
+        $st->{port}->{'pesit'         } = port_enabled($st, 'Pesit.Port', 'Pesit.Enabled');
+        $st->{port}->{'pesit/s'       } = port_enabled($st, 'Pesit.Ssl.Port', 'Pesit.Ssl.Enabled');
+        $st->{port}->{'pesit ptcp'    } = port_enabled($st, 'Pesit.pTCP.Port', 'Pesit.pTCP.Enabled');
+        $st->{port}->{'pesit/s ptcp'  } = port_enabled($st, 'Pesit.pTCP.Ssl.Port', 'Pesit.pTCP.Ssl.Enabled');
+        $st->{port}->{'pesit/s cft'   } = port_enabled($st, 'Pesit.CftSsl.Port', 'Pesit.CftSsl.Enabled');
+        $st->{port}->{'pesit bounce'  } = $st->{config}->{'Pesit.Bounce.Port'};
+        $st->{port}->{admin           } = $st->{config}->{'Admin.Port'};
+        $st->{port}->{'admin shutdown'} = $st->{config}->{'Admin.Http.Port'};
+        $st->{port}->{tomcat          } = $st->{config}->{'Tomcat.Shutdown.Port'};
+        $st->{port}->{'cluster/s'     } = $st->{config}->{'Cluster.Listeners.Listener.port.SSL'};
+        $st->{port}->{'tm jmx'        } = $st->{config}->{'TM.JMX.Port'};
+        if (defined (my $xml = xml_cheese ("$st->{home}/conf/configuration.xml"))) {
+            $st->{port}->{'database'} = $xml->{'Configuration.System.Database.port'};
+            $st->{port}->{'http jmx'} = $xml->{'Configuration.System.DaemonsConfigurationCommunication.HTTP.port'};
+            $st->{port}->{'ftp jmx'} = $xml->{'Configuration.System.DaemonsConfigurationCommunication.FTP.port'};
+        }
+
+        return $st->{port};
+    }
+
+    my $xml;
+    if (defined $st->{variant} and grep /EE/, @{$st->{variant}} or
+        defined $st->{version} and $st->{version} ge '4.5') {
+        # Jaguar AS2
+        if (defined ($xml = xml_cheese ("$st->{home}/tomcat5/conf/server.xml"))) {
+            my $l;
+            if ($l = xml_find ($xml, 'Server.Service.Connector', secure => undef)) {
+                $st->{port}->{'as2'} = $l->{port};
+            }
+            if ($l = xml_find ($xml, 'Server.Service.Connector', secure => 'true')) {
+                $st->{port}->{'as2/s'} = $l->{port};
+            }
+            $st->{port}->{'as2 shutdown'} = $xml->{'Server.port'};
+        }
+        # Pre-falcon TM admin
+        if (defined ($xml = xml_cheese ("$st->{home}/tomcat/conf/server.xml"))) {
+            my $l;
+            if ($l = xml_find ($xml, 'Server.ContextManager.Connector.Parameter', name => 'port')) {
+                $st->{port}->{'admin servlets'} = $l->{value};
+            }
+        }
+        if (defined ($xml = xml_cheese ("$st->{home}/brules/conf/brules.xml"))) {
+            $st->{port}->{'tm'}   = $xml->{'brulesconfig.eventmonitor.nonsecureserver.port'};
+            $st->{port}->{'tm/s'} = $xml->{'brulesconfig.eventmonitor.secureserver.port'};
+        }
+        # Falcon AS2
+        if (defined ($xml = xml_cheese ("$st->{home}/tomcat/as2/conf/server.xml"))) {
+            $st->{port}->{'as2 shutdown'} = $xml->{'Server.port'};
+        }
+        # Falcon Tomcat Admin
+        if (defined ($xml = xml_cheese ("$st->{home}/tomcat/admin/conf/server.xml"))) {
+            $st->{port}->{'admin shutdown'} = $xml->{'Server.port'};
+            $st->{port}->{'admin servlets'} = $xml->{'Server.Service.Connector.port'};
+        }
+        # Falcon listeners
+        if (defined ($xml = xml_cheese ("$st->{home}/conf/configuration.xml"))) {
+            my $l;
+            if ($l = xml_find ($xml, 'Configuration.Modules.TransactionManager.Listeners.Listener', ssl => 'true')) {
+                $st->{port}->{'tm/s'} = $l->{port}.($l->{enable} eq 'false' ? ' (disabled)':'');
+            }
+            if ($l = xml_find ($xml, 'Configuration.Modules.TransactionManager.Listeners.Listener', ssl => 'false')) {
+                $st->{port}->{'tm'} = $l->{port}.($l->{enable} eq 'false' ? ' (disabled)':'');
+            }
+            if ($l = xml_find ($xml, 'Configuration.Modules.As2.Listeners.Listener', ssl => 'true')) {
+                $st->{port}->{'as2/s'} = $l->{port}.($l->{enable} eq 'false' ? ' (disabled)':'');
+            }
+            if ($l = xml_find ($xml, 'Configuration.Modules.As2.Listeners.Listener', ssl => 'false')) {
+                $st->{port}->{'as2'} = $l->{port}.($l->{enable} eq 'false' ? ' (disabled)':'');
+            }
+            if ($l = xml_find ($xml, 'Configuration.Modules.Ssh.Listeners.Listener', ssl => 'true')) {
+                $st->{port}->{'ssh'} = $l->{port}.($l->{enable} eq 'false' ? ' (disabled)':'');
+            }
+            # and more for Firebird
+            $st->{port}->{'database'} = $xml->{'Configuration.System.Database.port'};
+            if ($l = xml_find ($xml, 'Configuration.Modules.Cluster.Listeners.Listener', ssl => 'false')) {
+                $st->{port}->{'cluster'} = $l->{port}.($l->{enable} eq 'false' ? ' (disabled)':'');
+            }
+            if ($l = xml_find ($xml, 'Configuration.Modules.Cluster.Listeners.Listener', ssl => 'true')) {
+                $st->{port}->{'cluster/s'} = $l->{port}.($l->{enable} eq 'false' ? ' (disabled)':'');
+            }
+        }
+    }
+    if (open CONF, "$st->{home}/conf/filedrive.conf") {
+        while (<CONF>) {
+            $st->{port}->{ftp} = $1, last if /server-port\s+"?(\d+)"?/;
+        }
+        close CONF;
+    }
+    if (open CONF, "$st->{home}/conf/agentd.conf") {
+        while (<CONF>) {
+            $st->{port}->{agentd} = $1, last if /agentport\s+(\d+)/;
+        }
+        close CONF;
+    }
+    if (open CONF, "$st->{home}/conf/admin.conf") {
+        while (<CONF>) {
+            if (/^\s*Listen\s+"?(?:[\d\.]+:)?(\d+)"?/) {
+                if (defined $st->{port}->{admin}) {
+                    $st->{port}->{addcert} = $1;
+                    last;
+                } else {
+                    $st->{port}->{admin} = $1;
+                }
+            }
+        }
+        close CONF;
+    }
+    if (open CONF, "$st->{home}/conf/httpd.conf") {
+        my $key = 'http';
+        while (<CONF>) {
+            if (/^\s*Listen\s+"?(?:[\d\.]+:)?(\d+)"?/) {
+                $st->{port}->{$key} = $1;
+            } elsif (/SSL/) {
+                $key = 'https';
+            }
+        }
+        close CONF;
+    }
+    return $st->{port};
+}
+
+sub st_mysql
+    #--------------------------------------------------------------------------#
+    # usage: @rows = st_mysql $st, $query                                      #
+    #                                                                          #
+    #--------------------------------------------------------------------------#
+{
+    my $st    = shift;
+    my $query = shift;
+
+    if ($st->{version} ge '5.0' || defined $st->{port}->{database}) {
+        my $command = "$st->{home}/mysql/bin/mysql".
+                      " -S $st->{home}/var/tmp/mysql.sock".
+                     #" -P $st->{port}->{database}".
+                      " -u root".
+                      " -ptumbleweed".
+                      " -D st".
+                      " -BN".
+                      " -e '$query;'".
+                      " 2>/dev/null";
+        my @result = split /\n/, qx($command);
+        return @result;
+    }
+    return ();
+}
+
+sub st_user
+    #--------------------------------------------------------------------------#
+    # usage: st_user $st [, $max];                                             #
+    #                                                                          #
+    #--------------------------------------------------------------------------#
+{
+    my $st    = shift;
+    my $max   = shift;
+    my $count = 0;
+
+    if ($st->{version} ge '5.0' || defined $st->{port}->{database}) {
+        my $query = "select loginName,password from VirtualUser".
+                    " order by loginName limit 10";
+        my @users = split /\n/, qx($query);
+        for my $record (st_mysql ($st, $query)) {
+            my ($user,$pass) = split /\t/, $record;
+            next unless defined $pass;
+            next if defined $st->{user}->{$user};
+            $pass = crack $user, $pass;
+            $st->{user}->{$user} = $pass;
+            last if defined $max and ++$count >= $max;
+        }
+    } else {
+        open FDC, "$st->{home}/conf/filedrive.conf" or return;
+        while (<FDC>) {
+            next if /^\s+#/;
+            chomp;
+            my @fdc = split;
+            if ($fdc[0] eq 'passwd-file' and $fdc[2] ne 'system') {
+                my $utype = $fdc[1];
+               (my $vpwfn = $fdc[2]) =~ s|^(?!/)|$st->{home}/etc/|;
+                if (open VPW, $vpwfn) {
+                    while (<VPW>) {
+                        chomp;
+                        my ($user, $pass) = split /:/;
+                        next unless defined $pass;
+                        next if defined $st->{user}->{$user};
+                        $pass = crack $user, $pass;
+                        $st->{user}->{$user} = $pass;
+                        last if defined $max and ++$count >= $max;
+                    }
+                    close VPW;
+                }
+            }
+            last if defined $max and $count >= $max;
+        }
+        close FDC;
+    }
+}
+
+sub st_tune
+{
+    my $st = shift;
+    return $st->{tune} if defined $st->{tune};
+
+    if (defined $st->{version} and $st->{version} ge '4.6') {
+        my $xml = xml_cheese ("$st->{home}/conf/configuration.xml");
+        if (defined $xml) {
+            my $l;
+            if ($l = xml_find ($xml, 'Configuration.Modules.TransactionManager.ThreadPools.ThreadPool', name => 'EventMonitor')) {
+                $st->{tune}->{'eventmonitor'} = "threads $l->{minThreads}..$l->{maxThreads}";
+            }
+            if ($l = xml_find ($xml, 'Configuration.System.EventQueue.ThreadPools.ThreadPool', name => 'EventQueue')) {
+                my $maxq = $xml->{'Configuration.System.EventQueue.SizeLimit.maxQueueSize'};
+                $st->{tune}->{'eventqueue'} = "threads $l->{minThreads}..$l->{maxThreads} maxq $maxq";
+            }
+            $st->{tune}->{'database pool'} = $xml->{'Configuration.System.Database.Options.hibernate.c3p0.min_size'}.'..'.
+                                       $xml->{'Configuration.System.Database.Options.hibernate.c3p0.max_size'};
+            $st->{tune}->{'tm ciphers'} = $xml->{'Configuration.Modules.TransactionManager.Listeners.Ssl.enabledCipherSuites'};
+        }
+        if (open my $httpd, "$st->{home}/conf/httpd.conf") {
+            my ($minspare, $maxspare, $start, $max);
+            while (<$httpd>) {
+                $minspare = $1 if /^\s*MinSpareServers\s+(\d+)/;
+                $maxspare = $1 if /^\s*MaxSpareServers\s+(\d+)/;
+                $start    = $1 if /^\s*StartServers\s+(\d+)/;
+                $max      = $1 if /^\s*MaxClients\s+(\d+)/;
+            }
+            close $httpd;
+            $st->{tune}->{'http servers'} = "spare $minspare..$maxspare start $start max $max";
+        }
+        if (open my $wpt, "$st->{home}/brules/local/wptdocuments/wptdocument.conf") {
+            $st->{tune}->{'mdn receipts'} = 'off';
+            $st->{tune}->{'repencrypt'} = 'off';
+            while (<$wpt>) {
+                $st->{tune}->{'mdn receipts'} = 'on' if /^MDNReceipting=enabled/;
+                $st->{tune}->{'repencrypt'}   = 'on' if /^RepEnc=enabled/;
+            }
+            close $wpt;
+        }
+        if (open my $tm, "$st->{home}/bin/start_tm") {
+            my ($min, $max);
+            while (<$tm>) {
+                $min = $1 if /JAVA_MEM_MIN\s*=\s*"([^"]+)/;
+                $max = $1 if /JAVA_MEM_MAX\s*=\s*"([^"]+)/;
+            }
+            $st->{tune}->{'java memory'} = "$min..$max";
+            close $tm;
+        }
+        if (open my $fdc, "$st->{home}/conf/filedrive.conf") {
+            while (<$fdc>) {
+                $st->{tune}->{'dns lookups'} = $1 if /^\s*dnslookups\s+(\S+)/;
+            }
+            close $fdc;
+        }
+    }
+    return $st->{tune};
+}
+sub st_list
+{
+    my %which = map {$_ => 1} @_ if @_;
+    my @st;
+    opendir ETCFD, "/etc/fd" or return;
+    while (my $env = readdir ETCFD) {
+        next unless $env =~ /^env\.sh(.*)/;
+        next if defined %which and not defined $which{$1};
+        my $st = {product => 'SecureTransport',
+                  alias   => $1};
+        next unless -d st_home $st;
+        st_readme  $st;
+        st_version $st;
+        st_config  $st;
+        st_port    $st;
+        st_admin   $st;
+        st_user    $st, 10;
+        st_tune    $st;
+        push @st, $st;
+    }
+    closedir ETCFD;
+    return \@st;
+}
+
+#==============================================================================#
+#                                 o u t p u t                                  #
+#==============================================================================#
+
+sub st_stack
+{
+    my $st = shift;
+    my ($alias, $home, $version, $build) = @_;
+
+    my $variants = ' '.join ',', @{$st->{variant}}
+        if defined $st->{variant};
+    push @$alias,   $st->{alias};
+    push @$home,    $st->{home};
+    push @$version, "$st->{version}$variants";
+    push @$build,   $st->{build};
+}
+
+sub st_dump
+{
+    my $st  = shift;
+    my $all = shift;
+
+    my $LINE = 'A8A15A*';
+
+    my $variants = join ',', @{$st->{variant}} if defined $st->{variant};
+    my $rc = "$st->{alias} ".
+             "[$st->{home} v$st->{version} $variants b$st->{build}]\n";
+
+    return $rc unless $all;
+
+    if (defined $st->{readme}) {
+        for my $readme (@{$st->{readme}}) {
+            $rc .= '   '.pack ($LINE, 'readme', $readme->{k}, $readme->{v})
+                        ."\n";
+        }
+    }
+    if (defined $st->{admin}) {
+        for my $admin (sort by_level @{$st->{admin}}) {
+            $rc .= '   '.pack ($LINE, 'admin', $admin->{user},
+                               "$admin->{pass} ($admin->{level})".
+                               ($admin->{locked}?' locked':''))
+                        ."\n";
+        }
+    }
+    if (defined $st->{port}) {
+        for my $port (sort by_port keys %{$st->{port}}) {
+            $rc .= '   '.pack ($LINE, 'port', $port, $st->{port}->{$port})
+                        ."\n";
+        }
+    }
+    if (defined $st->{user}) {
+        for my $user (sort keys %{$st->{user}}) {
+            $rc .= '   '.pack ($LINE, 'user', $user, $st->{user}->{$user})
+                        ."\n";
+        }
+    }
+    if (defined $st->{tune}) {
+        for my $tune (sort keys %{$st->{tune}}) {
+            $rc .= '   '.pack ($LINE, 'tune', $tune, $st->{tune}->{$tune})
+                        ."\n";
+        }
+    }
+
+    return $rc;
+}
+
+sub st_row
+{
+    my $heading = shift;
+    my $row     = shift;
+    my $label   = shift;
+    my $value   = shift;
+
+    my $rc = qq|<tr class="TR$$row" ><td><b>$$heading</b></td>|.
+             qq|<td>$label</td><td>$value</td></tr>\n|;
+    $$heading = '&nbsp;';
+    $$row = $$row eq 'odd' ? 'even' : 'odd';
+    return $rc;
+}
+
+sub st_table
+{
+    my $st = shift;
+
+    my $title = "$st->{product} $st->{version}";
+    $title .= " ($st->{build})" if $st->{build};
+    $title = join ' ', $title, @{$st->{variant}} if defined $st->{variant};
+
+    my $row   = 'odd';
+    my $heading;
+
+    #--- header
+    my $rc = <<".";
+      <table border="1" cellpadding="0" cellspacing="0">
+      <tr><td>
+        <table border="0" width="100%" cellpadding="1" cellspacing="0">
+          <tr><th colspan="3">$title</th></tr>
+          <tr><th>Category&nbsp;</th><th>Component&nbsp;</th><th>Value</th></tr>
+.
+    #--- identification
+    $heading = 'ID';
+    $rc .= st_row \$heading, \$row, 'alias', $st->{alias} if $st->{alias};
+    $rc .= st_row \$heading, \$row, 'home',  $st->{home}  if $st->{home};
+    if (defined $st->{readme}) {
+        for my $readme (@{$st->{readme}}) {
+            $rc .= st_row \$heading, \$row, $readme->{k}, $readme->{v};
+        }
+    }
+    #--- ports
+    $heading = 'Port';
+    chomp (my $hostname = `hostname`);
+    chomp ($hostname .= '.'.`cat /etc/defaultdomain`);
+    for my $port (sort by_port keys %{$st->{port}}) {
+        if (defined $st->{port}->{$port}) {
+            my $value = $PORTA{$port} || '<p>';
+            $value =~ s/<h>/$hostname/g;
+            $value =~ s/<p>/$st->{port}->{$port}/g;
+            $rc .= st_row \$heading, \$row, $port, "<b>$value</b>";
+        }
+    }
+    #--- admin
+    $heading = 'Admin';
+    if (defined $st->{admin}) {
+        for my $admin (sort by_level @{$st->{admin}}) {
+            my $user = $admin->{user};
+            $user .= " ($admin->{level})" if $admin->{level};
+            $rc .= st_row \$heading, \$row,
+                          $user, "password=<b>$admin->{pass}</b>";
+        }
+    }
+    #--- users
+    $heading = 'User';
+    if (defined $st->{user}) {
+        for my $user (sort keys %{$st->{user}}) {
+            $rc .= st_row \$heading, \$row,
+                          $user, "password=<b>$st->{user}->{$user}</b>";
+        }
+    }
+    #--- trailer
+    $rc .= "</table></td></tr></table>\n\n";
+
+    return $rc;
+}
+
+sub by_version
+{
+    return $b->{sort} cmp $a->{sort} if defined $a->{sort}
+                                    and defined $b->{sort};
+    return  1                        if defined $a->{sort};
+    return -1                        if defined $b->{sort};
+
+    my @a = split /\./, $a->{version};
+    my @b = split /\./, $b->{version};
+    my $rc = 0;
+    while (@a and @b) {
+        $rc = shift (@a) <=> shift (@b);
+        return $rc if $rc;
+    }
+    return $a->{alias} cmp $b->{alias};
+}
+
+sub version_column
+{
+    my $st = shift;
+    return (split /\./, $st->{sort})[0] if defined $st->{sort};
+    return join '.', ((split /\./, $st->{version})[0,1]);
+}
+
+sub st_html
+{
+    my $st_list = shift;
+
+    print qq|<html>|,
+          qq|<head>|,
+          qq|<link rel="stylesheet" type="text/css" href="johnt.css" />|,
+          qq|</head>\n|,
+          qq|<body>\n|,
+          qq|<table border="0" cellpadding="0" cellspacing="0">|,
+          qq|<tr valign="top">|,
+          qq|<td>\n|;
+
+    my $column;
+    for my $st (reverse sort by_version @$st_list) {
+        my $v2 = version_column ($st);
+        print qq|</td><td width="10">&nbsp;</td><td>\n|
+            if defined $column and $v2 ne $column;
+        $column = $v2;
+
+        print st_table ($st), "\n<br/>\n";
+    }
+
+    print "</td></tr></table></body></html>\n";
+}
+
+#==============================================================================#
+#                                   m a i n                                    #
+#==============================================================================#
+
+(my $PROGRAM = $0) =~ s/.*[\/\\]//;
+my $USAGE=<<".";
+
+usage: $PROGRAM: [options]
+
+options: -a        show detailed information for each ST
+         -h        HTML output
+         -A alias  display ST "alias" only
+         -help     display this message and exit
+.
+
+my $opt = &Getopts ('ahA@{help}');
+defined $opt && not $opt->{help}
+   or die $USAGE;
+
+push @{$opt->{A}}, @ARGV if @ARGV;
+
+my $st_list = $opt->{A} ? st_list (@{$opt->{A}}) : st_list ();
+
+if ($opt->{h}) {
+    if ($opt->{a}) {
+        open INDEX, '>/var/apache/htdocs/stlist.html'
+            or die "error: -h -a can not overwrite stlist.html: $!\n";
+        select INDEX;
+    }
+    st_html $st_list;
+} elsif ($opt->{A}) {
+    my %st_index;
+    for my $st (@$st_list) {
+        $st_index{$st->{alias}} = $st;
+    }
+    for my $alias (@{$opt->{A}}) {
+        if (!defined $st_index{$alias}) {
+            print STDERR "error: $alias not found\n";
+        } else {
+            print st_dump $st_index{$alias}, 1;
+        }
+    }
+} elsif ($opt->{a}) {
+    for my $st (sort by_version @$st_list) {
+        print st_dump $st, $opt->{a};
+    }
+} else {
+    my @alias   = ('Alias');
+    my @home    = ('Home');
+    my @version = ('Version');
+    my @build   = ('Build');
+    for my $st (sort by_version @$st_list) {
+       st_stack $st, \@alias, \@home, \@version, \@build;
+    }
+    print join "\n", column_print (\@alias, \@home, \@version, \@build), '';
+}

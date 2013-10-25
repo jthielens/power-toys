@@ -1,0 +1,1089 @@
+#!/usr/bin/perl
+
+use strict;
+use Text::ParseWords;
+use Data::Dumper;
+
+#==============================================================================#
+#                                o p t i o n s                                 #
+#==============================================================================#
+
+my $DEBUG = 0;
+my $opt;
+
+sub Getopts
+   #---------------------------------------------------------------------------#
+   # usage: &Getopts('a:bc@{flag}');                                           #
+   #                                                                           #
+   # Argument describes options as a sequence of option definitions.  Each     #
+   # definition consists of an option letter or a brace-enclosed option word   #
+   # followed by an optional mode character.  The mode may be : for a single-  #
+   # value option ($opt_* is set to the value), @ for a multi-valued option    #
+   # (values are pushed onto @opt_*), or missing for a boolean option ($opt_*  #
+   # is set to 1 if the option appears).                                       #
+   #                                                                           #
+   # An option may also be followed by [suboption,...], in which case the      #
+   # option must be invoked as -option[suboption,...] (no spaces!) or -option. #
+   # In this case, $opt_* is set if any suboption is chosen, and $opt_*{*} is  #
+   # set for each suboption specified.  -option by itself selects all          #
+   # suboptions.                                                               #
+   #                                                                           #
+   # Returns 1 if no errors were encountered.  Error disgnostics are printed   #
+   # to STDERR for each error encountered.                                     #
+   #---------------------------------------------------------------------------#
+{
+   my $argumentative = shift;
+   my (%args,$arg,$mode,$first,$rest);
+   my $errs = 0;
+   my $opt = {};
+
+   while ($argumentative) {
+      $argumentative =~ /\s*(\w|\{\w+\})([:@]|\[[^\]]*\])?(.*)/;
+      ($arg,$mode,$argumentative) = ($1,$2,$3);
+      $arg =~ s/[{}]//g;
+      if ($mode =~ /^\[/) {
+         for my $suboption (split (',', substr ($mode, 1, length ($mode)-2))) {
+            $args{"$arg.$suboption"} = $suboption;
+            print "args{$arg.$suboption} = $suboption\n" if $DEBUG;
+         }
+         $mode = '[';
+      }
+      $args{$arg} = $mode ? $mode : '';
+   }
+
+   while(@ARGV && ($_ = $ARGV[0]) =~ /^-(.)(.*)/) {
+      ($first,$rest) = ($1,$2);
+      my $t = "$first$rest";
+      #--------------------------------#
+      # look for -option[suboptions,,, #
+      #--------------------------------#
+      if ($t =~ /(\w+)(\[.*)/ && $args{$1} eq '[') {
+         $first = $1;
+         $rest  = $2;
+      } elsif(defined $args{$t}) {
+         ($first,$rest) = ($t,'');
+      }
+      if(defined $args{$first}) {
+         if($args{$first} eq '[') {
+            #-------------------------------------#
+            # $first is an option with suboptions #
+            #-------------------------------------#
+            shift(@ARGV);
+            $opt->{$first} = 1;
+            print "\$opt_$first = 1;\n" if $DEBUG;
+            if($rest =~ /^\[/) {
+               #--------------------------------------#
+               # we had -option[suboptions,...]stuff: #
+               #    put "stuff" back on ARGV          #
+               #--------------------------------------#
+               if($rest =~ /^(\[[^\]]*\])(.+)/) {
+                  $rest = $1;
+                  unshift(@ARGV, "-$2");
+               }
+            } elsif($rest eq '' && @ARGV && $ARGV[0] =~ /^\[.*\]$/) {
+               #----------------------------------------------#
+               # we had -option <whitespace> [suboptions,...] #
+               #----------------------------------------------#
+               $rest = shift(@ARGV);
+            }
+            if ($rest) {
+               #---------------------------------#
+               # we had some explicit suboptions #
+               #---------------------------------#
+               $rest =~ s/^\[//;
+               $rest =~ s/\]$//;
+               for my $suboption (split (',', $rest)) {
+                  next unless $suboption;
+                  my @hits = grep (/^$first.$suboption/, keys %args);
+                  if (@hits) {
+                     for my $hit (grep (/^$first.$suboption/, keys %args)) {
+                        $opt->{$first}->{$args{$hit}} = 1;
+                        print "\$opt_$first\{$args{$hit}\} = 1;\n" if $DEBUG;
+                     }
+                  } else {
+                     ++$errs;
+                     print STDERR "Unknown suboption: $first\[$suboption\]\n";
+                  }
+               }
+            } else {
+               #--------------------------------------#
+               # no explicit suboptions: set them all #
+               #--------------------------------------#
+               for my $suboption (grep (/^$first\./, keys %args)) {
+                  $opt->{$first}->{$args{$suboption}} = 1;
+                  print "\$opt_$first\{$args{$suboption}\} = 1;\n" if $DEBUG;
+               }
+            }
+         } elsif($args{$first}) {
+            #------------------------------------------------------#
+            # $first is a single- or multi- valued option (: or @) #
+            #------------------------------------------------------#
+            shift(@ARGV);
+            if($rest eq '') {
+               if (@ARGV) {
+                  $rest = shift(@ARGV);
+               } else {
+                  ++$errs;
+                  print STDERR "Option requires a value: $first\n";
+               }
+            }
+            if ($args{$first} eq '@') {
+               my %rest;
+               push @{$opt->{$first}}, split (/,/, $rest);
+               print "push (\@opt_$first, $rest);\n" if $DEBUG;
+            } else {
+               $opt->{$first} = $rest;
+               print "\$opt_$first = $rest;\n" if $DEBUG;
+            }
+         } else {
+            #----------------------------#
+            # $first is a simple Boolean #
+            #----------------------------#
+            $opt->{$first} = 1;
+            print "\$opt_$first = 1;\n" if $DEBUG;
+            if($rest eq '') {
+               shift(@ARGV);
+            } else {
+               $ARGV[0] = "-$rest";
+            }
+         }
+      } else {
+         print STDERR "Unknown option: $first\n";
+         ++$errs;
+         if($rest ne '') {
+            $ARGV[0] = "-$rest";
+         } else {
+            shift(@ARGV);
+         }
+      }
+   }
+   return if $errs;
+   return $opt;
+}
+
+#==============================================================================#
+#                                c o l u m n s                                 #
+#==============================================================================#
+
+sub column_width
+   #---------------------------------------------------------------------------#
+   # usage: $width = column_width ($string, ...);                              #
+   #                                                                           #
+   # Returns the length of the longest string in the argument list.  Note that #
+   # arguments may be strings or array references of strings (or array of      #
+   # array etc.), and the function recurses into the array refs.               #
+   #---------------------------------------------------------------------------#
+{
+   my $len = 0;
+   for my $i (@_) {
+      my $il = ref $i eq 'ARRAY' ? &column_width (@$i) : length ($i);
+      $len = $il if $il > $len;
+   }
+   return $len;
+}
+
+sub column_print
+   #---------------------------------------------------------------------------#
+   # usage: column_print (ARRAYREF, ARRAYREF, ...)                             #
+   #                                                                           #
+   # Each ARRAYREF is interpreted as a column in the output.  The first entry  #
+   # in each column is its heading: subsequent entries are values.  Entries    #
+   # may be strings or ARRAYREFs of strings, the latter being interpreted as   #
+   # multi-line values.  Prints width-adjusted output on the current output    #
+   # stream as follows:                                                        #
+   #                                                                           #
+   #   heading0          heading1               <- column headings             #
+   #   ----------------- ---------------------  <- automatic separator         #
+   #   value0.1          value1.1               <- string values               #
+   #   value0.2.0        value1.2               <- ARRAYREF on the left        #
+   #   value0.2.1                                                              #
+   #   value0.2.2                                                              #
+   #                     value1.3               <- extra values on the right   #
+   #---------------------------------------------------------------------------#
+{
+   my @widths = map (&column_width (@$_), @_);
+   my $fmt = 'A'.join ('A', map ($_+1, @widths));
+   $fmt =~ s/A\d+$/A*/;   # replace last width with '*'
+   my $n = (sort {$b <=> $a} map (scalar (@$_), @_)) [0];
+   my $nn;
+   my @rc;
+
+   for my $i (0..$n-1) {
+      $nn = (sort {$b <=> $a} map (ref $_->[$i] eq 'ARRAY' ?
+                                      scalar (@{$_->[$i]}) : 1,
+                                   @_)) [0];
+      for my $ii (0..$nn-1) {
+         push @rc, pack ($fmt, map (ref ($_->[$i]) eq 'ARRAY'
+                                    ? $_->[$i]->[$ii]
+                                    : $ii ? '' : $_->[$i], @_));
+      }
+      push @rc, pack ($fmt, map ('-' x $_, @widths)) if $i == 0;
+   }
+
+   return @rc;
+}
+
+#==============================================================================#
+#                      c h e e s y   x m l   p a r s e r                       #
+#==============================================================================#
+
+sub xml_cheese
+    #--------------------------------------------------------------------------#
+    # usage: my $xml = xml_cheese ($fn [, \&callback, @argv]);                 #
+    #                                                                          #
+    # Flattens XML file $fn into a flat HASHREF whose keys represent the       #
+    # elements and attributes of the XML document.  For a cheesy SAX-like      #
+    # parse, provide a calback and @argv context vector.                       #
+    #--------------------------------------------------------------------------#
+{
+    my $fn   = shift;
+    my $cb   = shift;
+    my @argv = @_;
+
+    open my $file, $fn or return;               # slurp $fn into $doc
+    my $doc = join '', <$file>;
+    close $file;
+
+    $doc =~ s/<\?[^>]*\?>[^<>]*//sg;            # discard <?...?>
+    $doc =~ s/<!--.*?-->[^<>]*//sg;             # discard comments
+    my @doc = split /\s*(>[^<>]*<)/s, $doc;        # parse into <elements>
+    $doc[0]  =~ s/^[^<>]*<//;                   # ... cleanup first <
+    $doc[-1] =~ s/>[^<>]*$//;                   # ... cleanup last >
+
+    my %doc;
+    my @path;
+    my %array;
+    for my $tok (@doc) {
+        if ($tok =~ />/) {                      # >content<
+            $tok =~ s/^>[\s\n\r]*//s;
+            $tok =~ s/[\s\n\r]*<$//s;
+            next unless length $tok;
+            &$cb ('>',$path[-1], $tok, @argv) if defined $cb;
+            $doc{join('.',@path)} = $tok;
+        } elsif ($tok =~ m|^/|) {               # </element>
+            $tok = substr $tok, 1;
+            print STDERR "warning: /$tok does not match $path[-1]\n"
+                if $opt->{w} && $path[-1] !~ /^$tok(?:\[\d+\])?$/;
+            pop @path;
+            &$cb ('-',$tok,join('.',@path),@argv) if defined $cb;
+        } else {                                # <element...> or <element.../>
+            my $close = 1 if $tok =~ s|\s*/$||;
+            my @tok = quotewords ('\s+', 0, $tok);
+            my $element = shift @tok;
+            my $path    = join '.', @path, $element;
+            my $element_tok = $element;
+            if (defined $array{$path}) {
+                if (!defined $cb and $array{$path} == 0) { # rename $path to $path[0]
+                    my @keys = grep /\Q$path./, keys %doc;
+                    for my $old (@keys) {
+                        my $new = $path . '[0]' . substr ($old, length $path);
+                        $doc{$new} = $doc{$old};
+                        delete $doc{$old};
+                    }
+                    @keys = grep /\Q$path./, keys %array;
+                    for my $old (@keys) {
+                        my $new = $path . '[0]' . substr ($old, length $path);
+                        $array{$new} = $array{$old};
+                        delete $array{$old};
+                    }
+                }
+                $array{$path}++;
+                $element .= "[$array{$path}]";
+                $path    .= "[$array{$path}]";
+            } else {
+                $array{$path} = 0;
+            }
+            &$cb ('+',$element_tok,$path,@argv) if defined $cb;
+            for my $attr (@tok) {
+                my ($a, $v) = split /=/, $attr, 2;
+                &$cb ('=',$a, $v, @argv) if defined $cb;
+                $doc{"$path.$a"} = $v;
+            }
+            push @path, $element unless $close; # <element.../>
+            &$cb ('-',$element_tok,join('.',@path),@argv) if defined $cb and $close;
+        }
+    }
+    return \%doc;
+}
+
+sub xml_find
+{
+    my $xml   = shift;
+    my $node  = shift;
+    my $key   = shift;
+    my $value = shift;
+
+    return unless defined $xml;
+    my $found;
+    if (!defined $value) {
+        # find $node[n] but not $node[n].key
+        my %seen;
+        for my $test (keys %$xml) {
+            next unless $test =~ /^(\Q$node\E(?:\[\d+\])?\.)/;
+            next if defined $seen{$1};
+            $seen{$1} = 1;
+            next if grep /^\Q$1$key/, keys %$xml;
+            $found = $1;
+            last;
+        }
+    } else {
+        for my $test (grep /^\Q$node\E(?:\[\d+\])?\.$key/, keys %$xml) {
+            if ($xml->{$test} eq $value) {
+                $found = substr $test, 0, length($test) - length($key);
+                last;
+            }
+        }
+    }
+    if (defined $found) {
+        my %found;
+        for my $match (grep /^\Q$found/, keys %$xml) {
+            $found{substr $match, length $found} = $xml->{$match};
+        }
+        return \%found;
+    }
+    return;
+}
+
+#==============================================================================#
+#                         f i l e d r i v e h o m e r                          #
+#==============================================================================#
+
+sub st_home
+{
+    my $st = shift;
+    return $st->{home} if defined $st->{home};
+
+    open ENV, "/etc/fd/env.sh$st->{alias}" or return;
+    while (my $line = <ENV>) {
+        chomp $line;
+        $st->{home} = $1, last if $line =~ /^FILEDRIVEHOME="?([^"]*)"?/;
+    }
+    close ENV;
+    return $st->{home};
+}
+
+sub st_list
+{
+    my %which = map {$_ => 1} @_ if @_;
+    my @st;
+    opendir ETCFD, "/etc/fd" or return;
+    while (my $env = readdir ETCFD) {
+        next unless $env =~ /^env\.sh(.*)/;
+        next if defined %which and not defined $which{$1};
+        my $st = {product => 'SecureTransport',
+                  alias   => $1};
+        next unless -d st_home $st;
+        push @st, $st;
+    }
+    closedir ETCFD;
+    return \@st;
+}
+
+sub filedrivehome
+{
+    my $sts = st_list;
+    return unless $sts and @$sts > 0;
+    if (@$sts == 1) {
+        return $sts->[0]{home};
+    }
+    my $pwd = $ENV{PWD};
+    for my $st (@$sts) {
+        return $st->{home} if $pwd =~ m|^$st->{home}(?:/.*)?$|;
+    }
+    return;
+}
+
+#==============================================================================#
+#                                   e d i t                                    #
+#==============================================================================#
+
+my %STREAMACCESS = ('none'   => '',
+                    'all'    => ' <input >output',
+                    'input'  => ' <input',
+                    'output' => ' >output',
+                   );
+my %COMPARATOR = ('equal'             => '==',
+                  'not-equal'         => '!=',
+                  'equal-ignore-case' => '=i=',
+                  'match'             => '=~',
+                  'contain'           => '=*=',
+                  '>'                 => '>',
+                  '>='                => '>=',
+                  '<',                => '<',
+                  '<=',               => '<=',
+                 );
+my %OPERATOR = ('and' => '&',
+                'or'  => '|',
+                'not' => '!',
+               );
+my @EVENT = ('Certificate Trust',
+             'Certificate Verification',
+             'Password Authentication',
+             'User Configuration',
+             'Login',
+             'Logout',
+           # 'Incoming*',
+             'Incoming start',
+             'Incoming end',
+             'Incoming abort',
+             'Incoming error',
+           # 'Outgoing*',
+             'Outgoing start',
+             'Outgoing end',
+             'Outgoing abort',
+             'Outgoing error',
+             'FTP Cmd - RETR',
+             'FTP Cmd - STOR',
+             'FTP Cmd - LIST',
+             'FTP Cmd - REST',
+             'FTP Cmd - MDTM',
+             'FTP Cmd - SIZE',
+             'FTP Cmd - RTCK',
+             'FTP Cmd - CWD',
+             'FTP Cmd - DELE',
+             'FTP Cmd - MKD',
+             'FTP Cmd - NLST',
+             'FTP Cmd - PWD',
+             'FTP Cmd - RMD',
+             'FTP Cmd - RNFR',
+             'FTP Cmd - RNTO',
+             'FTP Cmd - SITE',
+             'FTP Cmd - CHMOD',
+             'FTP Cmd - MIRR',
+             'FTP Cmd - CHPWD',
+             'FTP Cmd - COMB',
+             'HTTP Cmd - POST',
+             'Schedule',
+             'Server Transfer - Pull',
+             'Server Transfer - Push',
+             'Subscription',
+             'Session End',
+             'Application - Init',
+             'Application - Incoming',
+             'Application - Schedule',
+             'Transformation',
+             'AccessCheck - download',
+             'AddressBook - createcontact',
+             'AddressBook - deletecontact',
+             'AddressBook - retrievecontact',
+             'AddressBook - updatecontact',
+             'Application - PackagePostCommit',
+             'Application - PackagePreCommit',
+             'Application - filerelocated',
+             'Application - postprocess',
+             'Certificate verification',
+             'Logout getmessage',
+             'PMcommit',
+             'PMcreate',
+             'PMdelete',
+             'PMfolderSummary',
+             'PMitemAnonymousAuthorize',
+             'PMitemAnonymousGet',
+             'PMitemAnonymousList',
+             'PMitemCreate',
+             'PMitemDelete',
+             'PMitemDeleteContent',
+             'PMitemGet',
+             'PMitemList',
+             'PMitemPut',
+             'PMitemUpdate',
+             'PMlist',
+             'PMmove',
+             'PMupdate',
+             'Pesit ack',
+             'Pesit clearmap',
+             'Pesit getmap',
+             'Pesit idf',
+             'Pesit pause',
+             'Pesit resume',
+             'Pesit savemap',
+             'RBF Transfer',
+             'Resubmit cancel',
+             'Resubmit start',
+             'Retrieve Account',
+             'Sentinel update',
+             'ServiceMaintenance - bounce',
+             'ServiceMaintenance - syncend',
+             'ServiceMaintenance - syncstart',
+             'Synchrony Transfer',
+             'mbft',
+            );
+my %EVENT = map {$EVENT[$_] => $_} (0..$#EVENT);
+
+my $home = filedrivehome();
+my %ENABLED = ();
+{
+    my $path = '';
+    ($path = $ARGV[0]) =~ s|[^/]*$|| if @ARGV;
+    $path = "$home/brules/local/wptdocuments/" unless length $path > 0;
+    if (open my $conf, '<', $path.'wptdocument.conf') {
+        while (<$conf>) {
+            chomp;
+            my ($package,$state) = split /=/;
+            $ENABLED{$package} = 1 if $state eq 'enabled';
+        }
+        close $conf;
+    }
+}
+
+#==============================================================================#
+#                                 p a r s e r                                  #
+#==============================================================================#
+
+sub c_back
+{
+    my $op    = shift;
+    my $attr  = shift;
+    my $value = shift;
+    my $S     = shift;
+
+    my $handle = "$op$attr";
+    my $handler = $S->{handler}[-1] if defined $S->{handler};
+
+    if ($handler eq 'rule') {
+        #----------------------------------------#
+        # rule parser                            #
+        #----------------------------------------#
+        if ($handle eq '=name') {
+            $S->{rule}[-1]{name} = $value;
+        } elsif ($handle eq '=precedence') {
+            $S->{rule}[-1]{precedence} = $value;
+        } elsif ($handle eq '+condition') {
+            push @{$S->{handler}}, 'condition';
+            $S->{expr} = [[]];
+        } elsif ($handle eq '+inprocess-agent' or $handle eq '+external-agent') {
+            push @{$S->{handler}}, 'agent';
+            $S->{agent} = {type => $attr, param => []};
+        } elsif ($handle eq '-rule') {
+            pop @{$S->{handler}};
+        }
+    } elsif ($handler eq 'condition') {
+        #----------------------------------------#
+        # condition parser                       #
+        #----------------------------------------#
+        if ($handle eq '+item') {
+            push @{$S->{handler}}, 'item';
+        } elsif ($handle eq '+expression') {
+            push @{$S->{expr}}, [];
+            push @{$S->{handler}}, 'expression';
+        } elsif ($handle eq '+not') {
+            push @{$S->{expr}}, [];
+            push @{$S->{handler}}, 'not';
+        } elsif ($handle eq '=name') {
+            push @{$S->{expr}[-1]}, $OPERATOR{$value}
+                if @{$S->{expr}[-1]} or $value eq 'not';
+        } elsif ($handle eq '-condition') {
+            my $expr = pop @{$S->{expr}};
+            pop @$expr if $expr->[-1] eq '|' or $expr->[-1] eq '&'; # orphan op
+            for my $item (@$expr) {
+                next unless ref $item eq 'HASH';
+                $item = $item->{attr}.$item->{op}.$item->{value};
+            }
+            $S->{rule}[-1]{condition} = join (' ',@$expr);
+            delete $S->{expr};
+            pop @{$S->{handler}};
+        }
+    } elsif ($handler eq 'expression') {
+        #----------------------------------------#
+        # expression parser (in condition)       #
+        #----------------------------------------#
+        if ($handle eq '+item') {
+            push @{$S->{handler}}, 'item';
+        } elsif ($handle eq '+expression') {
+            push @{$S->{expr}}, [];
+            push @{$S->{handler}}, 'expression';
+        } elsif ($handle eq '+not') {
+            push @{$S->{expr}}, [];
+            push @{$S->{handler}}, 'not';
+        } elsif ($handle eq '=name') {
+            push @{$S->{expr}[-1]}, $OPERATOR{$value}
+                if @{$S->{expr}[-1]} or $value eq 'not';
+        } elsif ($handle eq '-expression') {
+            my $expr = pop @{$S->{expr}};
+            pop @$expr if $expr->[-1] eq '|' or $expr->[-1] eq '&'; # orphan op
+            for my $item (@$expr) {
+                next unless ref $item eq 'HASH';
+                $item = $item->{attr}.$item->{op}.$item->{value};
+            }
+            push @{$S->{expr}[-1]},
+                $#$expr==0 ? $expr->[0] : '('.join (' ',@$expr).')'
+                if @$expr;
+            pop @{$S->{handler}};
+        }
+    } elsif ($handler eq 'not') {
+        #--------------------------------------------#
+        # not expression parser (in condition)       #
+        #--------------------------------------------#
+        if ($handle eq '+item') {
+            push @{$S->{handler}}, 'item';
+        } elsif ($handle eq '+expression') {
+            push @{$S->{expr}}, [];
+            push @{$S->{handler}}, 'expression';
+        } elsif ($handle eq '+not') {
+            push @{$S->{expr}}, [];
+            push @{$S->{handler}}, 'not';
+        } elsif ($handle eq '=name') {
+            push @{$S->{expr}[-1]}, $OPERATOR{$value}
+                if @{$S->{expr}[-1]} or $value eq 'not';
+        } elsif ($handle eq '-not') {
+            my $expr = pop @{$S->{expr}};
+            pop @$expr if $expr->[-1] eq '|' or $expr->[-1] eq '&'; # orphan op
+            for my $item (@$expr) {
+                next unless ref $item eq 'HASH';
+                $item = $item->{attr}.$item->{op}.$item->{value};
+            }
+            push @{$S->{expr}[-1]},
+                '!'.($#$expr==0 ? $expr->[0] : '('.join (' ',@$expr).')')
+                if @$expr;
+            pop @{$S->{handler}};
+        }
+    } elsif ($handler eq 'item') {
+        #----------------------------------------#
+        # item parser (in condition)             #
+        #----------------------------------------#
+        if ($handle eq '>attribute') {
+            $S->{item} = {attr => $value};
+        } elsif ($handle eq '=name') {
+            $S->{item}{op} = $COMPARATOR{$value};
+        } elsif ($handle eq '>value') {
+            $S->{item}{value} = $value;
+        } elsif ($handle eq '-item') {
+            if ($S->{item}{attr} eq 'EventType') {
+                # first check for EventType and record this under [event]
+                my $event = $S->{rule}[-1]{event};
+                if (!defined $EVENT{$S->{item}{value}}) {
+                    print STDERR "warning: package $S->{package}:",
+                                 " unrecognized Event Type:",
+                                 " $S->{item}{value}\n"
+                    if $opt->{w};
+                }
+                if ($S->{item}{op} eq '==' or $S->{item}{op} eq '=i=') {
+                    push @$event, $S->{item}{value};
+                } else {
+                    push @$event, @EVENT
+                        if @$event == 0;
+                    for my $i (0..$#$event) {
+                        if ($event->[$i] eq $S->{item}{value}) {
+                            splice (@$event,$i,1);
+                            last;
+                        }
+                    }
+                }
+            } else {
+                # otherwise push this item onto the top of the expr stack
+                # check if the stack has an item and op for merging
+                my $expr = $S->{expr}[-1];
+                if ($#$expr >= 1 and
+                    ref $expr->[-2] eq 'HASH' and
+                    $expr->[-2]{attr} eq $S->{item}{attr} and
+                    $expr->[-2]{op}   eq $S->{item}{op}) {
+                    $expr->[-2]{value} .= $expr->[-1].$S->{item}{value};
+                    pop @$expr;
+                } else {
+                    push @$expr, $S->{item};
+                }
+            }
+            delete $S->{item};
+            pop @{$S->{handler}};
+        }
+    } elsif ($handler eq 'agent') {
+        #----------------------------------------#
+        # agent command line parser              #
+        #----------------------------------------#
+        if ($handle eq '>param-name') {
+            push @{$S->{agent}{param}}, $value;
+        } elsif ($handle eq '>param-value') {
+            ${$S->{agent}{param}}[-1] .= "=$value";
+        } elsif ($handle eq '=id') {
+            $S->{agent}{id} = $value;
+        } elsif ($handle eq '=executeafter') {
+            $S->{agent}{executeafter} = $value;
+        } elsif ($handle eq '=streamaccess') {
+            $S->{agent}{streamaccess} = $value;
+        } elsif ($handle eq '=wait') {
+            $S->{agent}{wait} = $value;
+        } elsif ($handle eq '=class') {
+            $S->{agent}{class} = $value;
+        } elsif ($handle eq '>commandline') {
+            $S->{agent}{commandline} = $value;
+        } elsif ($handle eq '-inprocess-agent' or $handle eq '-external-agent') {
+            my $cli;
+            # basic command line
+            if ($S->{agent}{type} eq 'inprocess-agent') {
+                (my $class = $S->{agent}{class}) =~ s/^com\.tumbleweed\.st\.server\././;
+                $class =~ s/^\.tm\.agents\./../;
+                $cli .= $class.'('.join(' ',@{$S->{agent}{param}}).')';
+            } else {
+                $cli = $S->{agent}{commandline};
+                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/perl" -I "\${FILEDRIVEHOME}/lib/perl5" -x "\${FILEDRIVEHOME}/bin/agents/(\S*)"(.*)$|(perl$1) $2$3|;
+                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/perl" -I "\${FILEDRIVEHOME}/lib/perl5" -x "\${FILEDRIVEHOME}/(\S*)"(.*)$|(perl$1) ../../$2$3|;
+                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/utils/(.*)"(.*)$|(utils$1) $2$3|;
+                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/agents/(.*)"(.*)$|(agents$1) $2$3|;
+                $cli .= ' ('.join(' ',@{$S->{agent}{param}}).')' if $S->{agent}{param};
+            }
+            # TODO logic to split rule at NextPrecedence goes here
+            # id and execution order prefix
+            my $id = $S->{agent}{id};
+            my $after = $S->{agent}{executeafter};
+            my $index = 1+$#{$S->{rule}[-1]{action}};
+            if ($id != $index+1 || (defined $after && $id != $after+1)) {
+                my $prefix;
+                $prefix .= "$after>" unless !defined $after || $id == $after+1;
+                $prefix .= "$id: ";
+                $cli = $prefix.$cli;
+            }
+            # streamaccess and async suffixes
+            $cli .= $STREAMACCESS{$S->{agent}{streamaccess}};
+            $cli .= ' &' unless defined $S->{agent}{wait} and $S->{agent}{wait} eq 'yes';
+            push @{$S->{rule}[-1]{action}}, $cli;
+            delete $S->{agent};
+            pop @{$S->{handler}};
+        }
+    } else {
+        # default handler
+        if ($handle eq '+rule') {
+            push @{$S->{handler}}, 'rule';
+            push @{$S->{rule}}, {name       => '',
+                                 precedence => 0,
+                                 condition  => '',
+                                 event      => [],
+                                 action     => [],
+                                 package    => $S->{package},
+                                 enabled    => $S->{enabled}};
+        } elsif ($handle eq '=name') {
+            $value =~ s/\.xml$//i;
+            $S->{package} = $value;
+            $S->{enabled} = defined $ENABLED{$value} ? 1 : 0;
+        }
+    }
+
+    delete $S->{handler} if $#{$S->{handler}} < 0;
+
+    # print STDERR "DEBUG: $op: $attr => $value\n";
+}
+
+#==============================================================================#
+#                                p r i n t e r                                 #
+#==============================================================================#
+
+sub by_precedence
+{
+    return $a->{precedence} <=> $b->{precedence}
+        || $a->{package}    cmp $b->{package}
+        || $a->{name}       cmp $b->{name};
+}
+
+sub null_intersection
+{
+    my %i;
+    for my $e (@{$_[0]}, @{$_[1]}) {
+        return if $i{$e}++;
+    }
+    return 1;
+}
+
+sub overlappable_rules
+{
+    return 1 if $_[0]->{precedence} == $_[1]->{precedence}
+            and null_intersection ($_[0]->{event}, $_[1]->{event});
+    return;
+}
+
+sub layout_columns
+{
+    my $rule   = shift;
+    my $filter = shift;
+
+    my @col = ();
+    my $last;
+    for my $r (@$rule) {
+        my $col_added;
+        for my $event (@{$r->{event}}) {
+            next if defined $filter and not exists $filter->{$event};
+            if (!defined $col_added and
+                (!defined $last or !overlappable_rules ($r, $last))) {
+                push @col, {precedence => $r->{precedence}};
+                $col_added = 1;
+            }
+            $r->{column} = $#col;
+            $col[-1]{$event} = $r;
+        }
+        $last = $r;
+    }
+    @col = sort {$a->{precedence} <=> $b->{precedence}} @col;
+    return \@col;
+}
+
+sub rule_name
+{
+    my $rule = shift;
+
+    my $name = $rule->{package}.'::'.$rule->{name};
+    $name .= '(disabled)' unless $rule->{enabled} or $opt->{enabled};
+    return $name;
+}
+
+sub print_table
+{
+    my $col    = shift;
+    my $html   = shift;
+    my $filter = shift;
+
+    # print column headings
+    if ($html) {
+        print '<html>',
+              '<head>',
+              '  <style type="text/css">',
+              '    th {color: #0;',
+              '        font-family: Arial, Helvetica;',
+              '        font-size: 10pt;',
+              '        font-weight: bold;',
+              '        text-decoration: none;',
+              '       }',
+              '    td {color: #666666;',
+              '        font-family: Arial, Helvetica;',
+              '        font-size: 8pt;',
+              '        text-decoration: none;',
+              '       }',
+              '  </style>',
+              '</head>',
+              '<body><table cellspacing="0" cellpadding="0" border="1">',
+              '<tr><th>',
+              join('</th><th>','Event',map {$_->{precedence}} @$col),
+              "</th></tr>\n";
+    } else {
+        print join(',','Event',map {$_->{precedence}} @$col), "\n";
+    }
+
+    # for each event
+    for my $event (@EVENT) {
+        next if defined $filter and not exists $filter->{$event};
+        # dump text into @out
+        my @out;
+        push @out, [$event];
+        # print rule names for each column
+        for my $c (@$col) {
+            my $rule = $c->{$event};
+            if (defined $rule) {
+                push @out, [rule_name($rule)];
+                push @{$out[-1]}, 'condition: '.$rule->{condition}
+                    if length $rule->{condition};
+                for my $a (@{$rule->{action}}) {
+                    push @{$out[-1]}, 'action   : '.$a;
+                }
+            } else {
+                push @out, [];
+            }
+        }
+        # now print @out
+        if ($html) {
+            print '<tr>';
+            my $td = 'th';
+            for my $out (@out) {
+                print qq(<$td nowrap="true" valign="top" align="left">);
+                if (@$out) {
+                    my $td = join "\n", @$out;
+                    $td =~ s/&/&amp;/gs;
+                    $td =~ s/</&lt;/gs;
+                    $td =~ s/>/&gt;/gs;
+                    $td =~ s/\n/<br>/gs;
+                    print $td;
+                } else {
+                    print '&nbsp;';
+                }
+                print "</$td>";
+                $td = 'td';
+            }
+            print "</tr>\n";
+        } else {
+            my $more = 1;
+            while ($more) {
+                $more = 0;
+                for my $out (@out) {
+                    if (@$out) {
+                        print shift @$out;
+                        $more = 1 if @$out;
+                    }
+                    print ',';
+                }
+                print "\n";
+            }
+        }
+    }
+
+    print "</table></body></html>\n" if $html;
+}
+
+sub print_rule
+{
+    my $r      = shift;
+    my $events = shift;
+    my $action = shift;
+
+    print rule_name($r), " : $r->{precedence}\n";
+    print "  event    : $_\n"              for @$events;
+    print "  condition: $r->{condition}\n" if length $r->{condition};
+    print "  action   : $_\n"              for @$action;
+}
+
+sub find_np
+{
+    my $action = shift;
+
+    for my $i (0..$#$action) {
+        return $i if $action->[$i] =~ /\.\.NextPrecedence\(/;
+    }
+    return -1;
+}
+
+sub in_action
+{
+    my $action = shift;
+    my $np     = find_np ($action);
+    return $action if $np < 0 or $np >= $#$action;
+    return []      if $np == 0;
+    return [@$action[0..$np]];
+}
+
+sub out_action
+{
+    my $action = shift;
+    my $np     = find_np ($action);
+    return [] if $np < 0 or $np >= $#$action;
+    return $action if $np == 0;
+    return ['.....', @$action[$np+1..$#$action]];
+}
+
+sub print_rules
+{
+    my $rule   = shift;
+    my $filter = shift;
+
+    my $n      = 0;
+
+    for my $r (sort by_precedence @$rule) {
+        my @events = @{$r->{event}};
+        if (defined $filter) {
+            if (ref $filter eq 'HASH') {
+                @events = grep {exists $filter->{$_}} @events;
+                next unless @events;
+            } else {
+                next unless grep {$_ eq $filter} @events;
+                @events = ();
+            }
+        }
+        my $action = in_action ($r->{action});
+        next unless @$action;
+        if ($n == 0 and ref $filter ne 'HASH') {
+            print "===== $filter =====\n";
+        }
+        print_rule ($r, \@events, $action);
+        $n++;
+    }
+    for my $r (reverse sort by_precedence @$rule) {
+        my @events = @{$r->{event}};
+        if (defined $filter) {
+            if (ref $filter eq 'HASH') {
+                @events = grep {exists $filter->{$_}} @events;
+                next unless @events;
+            } else {
+                next unless grep {$_ eq $filter} @events;
+                @events = ();
+            }
+        }
+        my $action = out_action ($r->{action});
+        next unless @$action;
+        if ($n == 0 and ref $filter ne 'HASH') {
+            print "===== $filter =====\n";
+        }
+        print_rule ($r, \@events, $action);
+        $n++;
+    }
+}
+
+#==============================================================================#
+#                                   m a i n                                    #
+#==============================================================================#
+
+(my $PROGRAM = $0) =~ s/.*[\/\\]//;
+my $USAGE=<<".";
+
+usage: $PROGRAM: [options]
+
+options: 
+         -table               print a rule table
+         -html                print rule table in html
+         -e[vent]  event,...  restrict output to requested events
+         -events              display event table
+         -help                display this message and exit
+         -1                   sort by event instead of by rule
+         -enabled             suppress (disabled) labels
+.
+
+$opt = &Getopts ('{table}{html}{events}@e@{event}{help}h1{enabled}w');
+defined $opt && not ($opt->{help} || $opt->{h})
+    or die $USAGE;
+
+if ($opt->{events}) {
+    my $rows = 1+$#EVENT/3;
+    for my $i (0..$rows-1) {
+        print pack('A26A26A*',@EVENT[$i,$i+$rows,$i+2*$rows]), "\n";
+    }
+    exit 0;
+}
+
+my $filter;
+if (defined $opt->{e} || defined $opt->{event}) {
+    my @e;
+    push @e, @{$opt->{e}} if defined $opt->{e};
+    push @e, @{$opt->{event}} if defined $opt->{event};
+    $filter = {};
+    for my $e (@e) {
+        my @match = grep (/$e/i, @EVENT);
+        if (@match) {
+            for my $match (@match) {
+                $filter->{$match} = 1;
+            }
+        } else {
+            print STDERR "warning: no event types found matching $e\n"
+               if $opt->{w};
+        }
+    }
+}
+
+if (!@ARGV and defined $home) {
+    push @ARGV, <$home/brules/local/wptdocuments/*.xml>;
+}
+
+my $package = {};
+for my $fn (@ARGV) {
+    $fn = "$fn.xml"
+          if !-f $fn and -f "$fn.xml";
+    $fn = "$home/brules/local/wptdocuments/$fn"
+          if !-f $fn and -f "$home/brules/local/wptdocuments/$fn";
+    $fn = "$home/brules/local/wptdocuments/$fn.xml"
+          if !-f $fn and -f "$home/brules/local/wptdocuments/$fn.xml";
+    my $xml = xml_cheese ($fn, \&c_back, $package);
+    print STDERR "warning: filename mismatch for $package->{package}: $fn\n"
+        unless !$opt->{w} || $fn =~ m|^(?:.*/)?$package->{package}.xml$|;
+}
+exit unless defined $package->{rule};
+my $rules = $package->{rule};
+if ($opt->{table} || $opt->{html}) {
+    my $col = layout_columns ($rules, $filter);
+    print_table ($col, $opt->{html}, $filter);
+} elsif (defined $filter and scalar (keys %$filter) == 1) {
+    print_rules ($rules, (keys %$filter)[0]);
+} elsif (defined $opt->{1}) {
+    if (defined $filter) {
+        for my $event (sort {$EVENT{$a}<=>$EVENT{$b}} keys %$filter) {
+            print_rules ($rules, $event);
+        }
+    } else {
+        for my $event (@EVENT) {
+            print_rules ($rules, $event);
+        }
+    }
+} else {
+    print_rules ($rules, $filter);
+}
