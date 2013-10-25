@@ -715,8 +715,8 @@ sub c_back
                 $cli .= $class.'('.join(' ',@{$S->{agent}{param}}).')';
             } else {
                 $cli = $S->{agent}{commandline};
-                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/perl" -I "\${FILEDRIVEHOME}/lib/perl5" -x "\${FILEDRIVEHOME}/bin/agents/(\S*)"(.*)$|(perl$1) $2$3|;
-                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/perl" -I "\${FILEDRIVEHOME}/lib/perl5" -x "\${FILEDRIVEHOME}/(\S*)"(.*)$|(perl$1) ../../$2$3|;
+                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/perl" -I "\${FILEDRIVEHOME}/lib/perl5" (?:-I "\${FILEDRIVEHOME}/lib/perl5/site_perl" )?-x "\${FILEDRIVEHOME}/bin/agents/(\S*)"(.*)$|(perl$1) $2$3|;
+                $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/perl" -I "\${FILEDRIVEHOME}/lib/perl5" (?:-I "\${FILEDRIVEHOME}/lib/perl5/site_perl" )?-x "\${FILEDRIVEHOME}/(\S*)"(.*)$|(perl$1) ../../$2$3|;
                 $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/utils/(.*)"(.*)$|(utils$1) $2$3|;
                 $cli =~ s|^"\${FILEDRIVEHOME}/bin/utils/runas"\s*( -r)?\s*"\${FILEDRIVEHOME}/bin/agents/(.*)"(.*)$|(agents$1) $2$3|;
                 $cli .= ' ('.join(' ',@{$S->{agent}{param}}).')' if $S->{agent}{param};
