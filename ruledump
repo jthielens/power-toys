@@ -709,7 +709,8 @@ sub c_back
             my $cli;
             # basic command line
             if ($S->{agent}{type} eq 'inprocess-agent') {
-                (my $class = $S->{agent}{class}) =~ s/^com\.tumbleweed\.st\.server\././;
+                (my $class = $S->{agent}{class}) =~
+                    s/^com\.(tumbleweed|axway)\.st\.server\././;
                 $class =~ s/^\.tm\.agents\./../;
                 $cli .= $class.'('.join(' ',@{$S->{agent}{param}}).')';
             } else {
