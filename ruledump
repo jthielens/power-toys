@@ -710,7 +710,7 @@ sub c_back
             # basic command line
             if ($S->{agent}{type} eq 'inprocess-agent') {
                 (my $class = $S->{agent}{class}) =~
-                    s/^com\.(tumbleweed|axway)\.st\.server\././;
+                   s/^com\.(tumbleweed|axway)\.st\.server\././;
                 $class =~ s/^\.tm\.agents\./../;
                 $cli .= $class.'('.join(' ',@{$S->{agent}{param}}).')';
             } else {
@@ -1020,14 +1020,14 @@ options:
          -enabled             suppress (disabled) labels
 .
 
-$opt = &Getopts ('{table}{html}{events}@e@{event}{help}h1{enabled}w');
+$opt = &Getopts ('{table}{html}{event}@e@{events}{help}h1{enabled}w');
 defined $opt && not ($opt->{help} || $opt->{h})
     or die $USAGE;
 
 if ($opt->{events}) {
     my $rows = 1+$#EVENT/3;
     for my $i (0..$rows-1) {
-        print pack('A26A26A*',@EVENT[$i,$i+$rows,$i+2*$rows]), "\n";
+        print pack('A25A32A*',@EVENT[$i,$i+$rows,$i+2*$rows]), "\n";
     }
     exit 0;
 }
