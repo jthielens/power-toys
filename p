@@ -28,7 +28,7 @@ sub Getopts
    local($argumentative) = @_;
    local(%args,$arg,$mode,$_,$first,$rest);
    local($errs) = 0;
-   local($[) = 0;
+   # local($[) = 0;
 
    while ($argumentative) {
       $argumentative =~ /\s*(\w|\{\w+\})([:@]|\[[^\]]*\])?(.*)/;
