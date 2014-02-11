@@ -300,7 +300,7 @@ sub dump_ps
 sub tty_width
 {
    my $stty = `stty -a 2>/dev/null`;
-   return $1 if $stty =~ /columns\s*=\s*(\d+)/;
+   return $1 if $stty =~ /columns\s*=?\s*(\d+)/;
    return 80;
 }
 
