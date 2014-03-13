@@ -1,0 +1,3694 @@
+#!/usr/bin/perl
+
+# use MIME::Base64;  - replaced v1.1.1
+
+$VERSION = <<"";
+Version Description                        Date   Who
+------- ---------------------------------- ------ ---
+1.2.14  cleanup some modern perl warnings  140313 jbt
+1.2.13  asn:typeforce, -n output           070323 jbt
+1.2.12  crldp extensions, openssl -text    030212 jbt
+1.2.11  explicit input asn matching bug    010904 jbt
+1.2.10  p7 signedData renaming             010802 jbt
+1.2.9   File output bug fix                010726 jbt
+1.2.8   Raw CGI dumps and Identrus plugin  010709 jbt
+1.2.7   Removed 'die' calls                010708 jbt
+1.2.6   ValiCert License support           010703 jbt
+1.2.5   CRLReason miscoded                 010611 jbt
+1.2.4   increased offset:length widths     010502 jbt
+1.2.3   fixed -in file[asn.extension]      010216 jbt
+1.2.2   fixed -in file[asn.field]          010131 jbt
+1.2.1   scvp types                         001204 jbt
+1.2.0   cgi/command line dual mode         001127 jbt
+1.1.4   internal restructuring             001117 jbt
+1.1.3   hex output, -err                   001011 jbt
+1.1.2   some fixes                         000809 jbt
+1.1.1   Built-in pure-perl base64          000707 jbt
+1.1.0   DWIM default output formats        000630 jbt
+1.0.8   netscape extensions, stdout bugs   000627 jbt
+1.0.7   fix bugs with invalid asn.1        000604 jbt
+1.0.6   some BER encodings (outlook p7m)   000601 jbt
+1.0.5   improved extension support         000526 jbt
+1.0.4   asn support                        000523 jbt
+1.0.3   #xx[:len] pseudo-input files       000509 jbt
+1.0.2   hex/b64 ignores irrelevant lines   000425 jbt
+1.0.1   hex input                          000424 jbt
+1.0.0   Original version                   000420 jbt
+
+$V = (split (' ', (split ("\n", $VERSION, 4))[2], 2))[0];
+
+#==============================================================================#
+#                                o p t i o n s                                 #
+#==============================================================================#
+
+sub Getopts
+   #---------------------------------------------------------------------------#
+   # usage: &Getopts('a:bc@{flag}', \@error);                                  #
+   #                                                                           #
+   # Argument describes options as a sequence of option definitions.  Each     #
+   # definition consists of an option letter or a brace-enclosed option word   #
+   # followed by an optional mode character.  The mode may be : for a single-  #
+   # value option ($opt_* is set to the value), @ for a multi-valued option    #
+   # (values are pushed onto @opt_*), or missing for a boolean option ($opt_*  #
+   # is set to 1 if the option appears).                                       #
+   #                                                                           #
+   # An option may also be followed by [suboption,...], in which case the      #
+   # option must be invoked as -option[suboption,...] (no spaces!) or -option. #
+   # In this case, $opt_* is set if any suboption is chosen, and $opt_*{*} is  #
+   # set for each suboption specified.  -option by itself selects all          #
+   # suboptions.                                                               #
+   #                                                                           #
+   # Returns 1 if no errors were encountered.  Error disgnostics are pushed    #
+   # onto @$error each error encountered.                                      #
+   #---------------------------------------------------------------------------#
+{
+   local($argumentative) = shift @_;
+   local($error)         = shift @_;
+   local(%args,$arg,$mode,$_,$first,$rest);
+   local($errs) = 0;
+   # local($[) = 0;
+
+   while ($argumentative) {
+      $argumentative =~ /\s*(\w|\{\w+\})([:@]|\[[^\]]*\])?(.*)/;
+      ($arg,$mode,$argumentative) = ($1,$2,$3);
+      $arg =~ s/[{}]//g;
+      if ($mode =~ /^\[/) {
+         for $suboption (split (',', substr ($mode, 1, length ($mode)-2))) {
+            $args{"$arg.$suboption"} = $suboption;
+            print "args{$arg.$suboption} = $suboption\n" if $DEBUG;
+         }
+         $mode = '[';
+      }
+      $args{$arg} = $mode ? $mode : '';
+   }
+
+   while(@ARGV && ($_ = $ARGV[0]) =~ /^-(.)(.*)/) {
+      ($first,$rest) = ($1,$2);
+      local ($t) = "$first$rest";
+      #--------------------------------#
+      # look for -option[suboptions,,, #
+      #--------------------------------#
+      if ($t =~ /(\w+)(\[.*)/ && $args{$1} eq '[') {
+         $first = $1;
+         $rest  = $2;
+      } elsif(defined $args{$t}) {
+         ($first,$rest) = ($t,'');
+      }
+      if(defined $args{$first}) {
+         if($args{$first} eq '[') {
+            #-------------------------------------#
+            # $first is an option with suboptions #
+            #-------------------------------------#
+            shift(@ARGV);
+            eval "\$opt_$first = 1;";
+            print "\$opt_$first = 1;\n" if $DEBUG;
+            if($rest =~ /^\[/) {
+               #--------------------------------------#
+               # we had -option[suboptions,...]stuff: #
+               #    put "stuff" back on ARGV          #
+               #--------------------------------------#
+               if($rest =~ /^(\[[^\]]*\])(.+)/) {
+                  $rest = $1;
+                  unshift(@ARGV, "-$2");
+               }
+            } elsif($rest eq '' && @ARGV && $ARGV[0] =~ /^\[.*\]$/) {
+               #----------------------------------------------#
+               # we had -option <whitespace> [suboptions,...] #
+               #----------------------------------------------#
+               $rest = shift(@ARGV);
+            }
+            if ($rest) {
+               #---------------------------------#
+               # we had some explicit suboptions #
+               #---------------------------------#
+               $rest =~ s/^\[//;
+               $rest =~ s/\]$//;
+               for $suboption (split (',', $rest)) {
+                  next unless $suboption;
+                  local (@hits) = grep (/^$first.$suboption/, keys %args);
+                  if (@hits) {
+                     for $hit (grep (/^$first.$suboption/, keys %args)) {
+                        eval "\$opt_$first\{$args{$hit}\} = 1;";
+                        print "\$opt_$first\{$args{$hit}\} = 1;\n" if $DEBUG;
+                     }
+                  } else {
+                     ++$errs;
+                     push @$error, "unknown suboption: $first\[$suboption\]";
+                  }
+               }
+            } else {
+               #--------------------------------------#
+               # no explicit suboptions: set them all #
+               #--------------------------------------#
+               for $suboption (grep (/^$first\./, keys %args)) {
+                  eval "\$opt_$first\{$args{$suboption}\} = 1;";
+                  print "\$opt_$first\{$args{$suboption}\} = 1;\n" if $DEBUG;
+               }
+            }
+         } elsif($args{$first}) {
+            #------------------------------------------------------#
+            # $first is a single- or multi- valued option (: or @) #
+            #------------------------------------------------------#
+            shift(@ARGV);
+            if($rest eq '') {
+               if (@ARGV) {
+                  $rest = shift(@ARGV);
+               } else {
+                  ++$errs;
+                  push @$error, "option requires a value: $first";
+               }
+            }
+            if ($args{$first} eq '@') {
+               my %rest;
+               eval "push (\@opt_$first, split (',', \$rest));";
+               print "push (\@opt_$first, $rest);\n" if $DEBUG;
+            } else {
+               eval "\$opt_$first = \$rest;";
+               print "\$opt_$first = $rest;\n" if $DEBUG;
+            }
+         } else {
+            #----------------------------#
+            # $first is a simple Boolean #
+            #----------------------------#
+            eval "\$opt_$first = 1;";
+            print "\$opt_$first = 1;\n" if $DEBUG;
+            if($rest eq '') {
+               shift(@ARGV);
+            } else {
+               $ARGV[0] = "-$rest";
+            }
+         }
+      } else {
+         push @$error, "unknown option: $first";
+         ++$errs;
+         if($rest ne '') {
+            $ARGV[0] = "-$rest";
+         } else {
+            shift(@ARGV);
+         }
+      }
+   }
+   $errs == 0;
+}
+
+#==============================================================================#
+#                                    h e x                                     #
+#==============================================================================#
+
+sub decode_hex
+   #---------------------------------------------------------------------------#
+   # usage: $bin = &decode_hex ($hex, \@error);                                #
+   #                                                                           #
+   # Decodes a string of hex-encoded bytes, returning the equivalent binary.   #
+   # Any non-hex characters are discarded before decoding -- while this is     #
+   # intended to allow for white space and newlines, the results are           #
+   # unpredictable when passed arbitrary text.  If the length of $hex (after   #
+   # cleaning) is odd, the function pushes an error message on @$error.        #
+   #---------------------------------------------------------------------------#
+{
+   my $buf   = shift @_;
+   my $error = shift @_;
+
+   $buf =~ s/[^0-9a-fA-F]+//g;
+   if (length ($buf) & 1) {
+      push @$error, "error: hex input requires an even length";
+      return;
+   }
+   $buf =~ s/(..)/chr(hex($1))/eg;
+   return $buf;
+}
+
+sub encode_hex
+   #---------------------------------------------------------------------------#
+   # usage: $hex = &encode_hex ($bin);                                         #
+   #                                                                           #
+   # Encodes an arbitrary binary buffer as a sequence of hex-encoded bytes.    #
+   # The buffer returned is exactly twice the length of $bin.                  #
+   #---------------------------------------------------------------------------#
+{
+   my $buf = shift @_;
+   $buf =~ s/([\x00-\xff])/sprintf('%02x',ord($1))/eg;
+   return $buf;
+}
+
+#==============================================================================#
+#                                 b a s e 6 4                                  #
+#==============================================================================#
+
+#------------------------------------------------------------------------------#
+# Home-Grown Base64 functions -- sure, MIME:Base64 already provides this, but  #
+# the home version makes this script independent of a PPM-enabled or Internet- #
+# connected Perl installation.  This is not guaranteed to be fast, but it gets #
+# the job done!                                                                #
+#------------------------------------------------------------------------------#
+
+my @map64 = (6,0,1,2,9,10,4,5,12,13,14,8);
+   #---------------------------------------------------------------------------#
+   # This is a "vec" map for remapping 24-bit base64 fragments in 2-bit hunks. #
+   # It is a little complicated because base64 views the mapping in 6-bit      #
+   # frames, left-to-right, while vec indexes from LSB to MSB (right-to-left)  #
+   # a byte, but then indexes bytes left-to-right.  In 2-bit vec-speak, this   #
+   # yields a mapping as follows:                                              #
+   #   binary (3 bytes): 3 2 1 0|7 6 5 4|b a 9 8                               #
+   #   base64 (4 bytes): 2 1 0|6 5 4|a 9 8|e d c                               #
+   # @map64 is a decoding map, so it is indexed by the binary index and        #
+   # the entry then contains the 2-bit vec index for the corresponding base64. #
+   # This is easily reversed, of course, for encoding (see &db64 and &eb64).   #
+   #---------------------------------------------------------------------------#
+
+sub db64
+   #---------------------------------------------------------------------------#
+   # usage: $decoded3bytes = &db64 ($encoded4bytes);                           #
+   #                                                                           #
+   # Decodes the base64 fragment in $encoded4bytes, returning the equivalent   #
+   # binary 3 bytes.                                                           #
+   #---------------------------------------------------------------------------#
+{
+   my $b64 = shift @_;
+   my $bin = '';
+   for $i (0..$#map64) {
+      vec ($bin, $i, 2) = vec ($b64, $map64[$i], 2);
+   }
+   return $bin;
+}
+
+sub eb64
+   #---------------------------------------------------------------------------#
+   # usage: $encoded4bytes = &eb64 ($binary3bytes);                            #
+   #                                                                           #
+   # Encodes the 3 byte string $binary3bytes into base64, returning a 4 byte   #
+   # base64 fragment.                                                          #
+   #---------------------------------------------------------------------------#
+{
+   my $bin = shift @_;
+   my $b64 = '';
+
+   for $i (0..$#map64) {
+      vec ($b64, $map64[$i], 2) = vec ($bin, $i, 2);
+   }
+   return $b64;
+}
+
+sub decode_b64
+   #---------------------------------------------------------------------------#
+   # usage: $bin = &decode_b64 ($b64, \@error);                                #
+   #                                                                           #
+   # Decodes a string of base64-encoded bytes, returning the equivalent        #
+   # binary.  If the length of $b64 is not divisible by 4 or does not "look    #
+   # like" base64, the function pushes an error onto @$error.                  #
+   #---------------------------------------------------------------------------#
+{
+   my $buf   = shift @_;
+   my $error = shift @_;
+   my $pad   = 0;
+
+   if (length ($buf) & 3 or $buf !~ m|^[A-Za-z0-9+/]+={0,2}$|) {
+      push @$error, "error: base64 input requires a length divisible by four.";
+      return;
+   }
+   $pad++ if $buf =~ /=$/;
+   $pad++ if $buf =~ /==$/;
+   $buf =~ tr|A-Za-z0-9+/|\x00-\x3F|;
+   $buf =~ s/(....)/&db64($1)/egs;
+   return substr ($buf, 0, length ($buf)-$pad);
+}
+
+sub encode_b64
+   #---------------------------------------------------------------------------#
+   # usage: @b64 = &encode_b64 ($bin);                                         #
+   #                                                                           #
+   # Encodes an arbitrary binary buffer as a sequence of base64-encoded bytes. #
+   #---------------------------------------------------------------------------#
+{
+   my $buf = shift @_;
+   my $pad = length ($buf) % 3;
+   $pad = 3-$pad if $pad;
+   $buf .= "\0" x $pad;
+   $buf =~ s/(...)/&eb64($1)/egs;
+   $buf =~ tr|\x00-\x3F|A-Za-z0-9+/|;
+   substr ($buf, $#buf,   1, '=') if $pad > 0;
+   substr ($buf, $#buf-1, 1, '=') if $pad > 1;
+   $buf =~ s/(.{64})/$1\n/g;
+   if (wantarray) {
+      return split ("\n", $buf);
+   } else {
+      return "$buf\n";
+   }
+}
+
+#==============================================================================#
+#                                c o l u m n s                                 #
+#==============================================================================#
+
+sub column_width
+   #---------------------------------------------------------------------------#
+   # usage: $width = column_width ($string, ...);                              #
+   #                                                                           #
+   # Returns the length of the longest string in the argument list.  Note that #
+   # arguments may be strings or array references of strings (or array of      #
+   # array etc.), and the function recurses into the array refs.               #
+   #---------------------------------------------------------------------------#
+{
+   my $len = 0;
+   for $i (@_) {
+      my $il = ref $i eq 'ARRAY' ? &column_width (@$i) : length ($i);
+      $len = $il if $il > $len;
+   }
+   return $len;
+}
+
+sub column_print
+   #---------------------------------------------------------------------------#
+   # usage: column_print (ARRAYREF, ARRAYREF, ...)                             #
+   #                                                                           #
+   # Each ARRAYREF is interpreted as a column in the output.  The first entry  #
+   # in each column is its heading: subsequent entries are values.  Entries    #
+   # may be strings or ARRAYREFs of strings, the latter being interpreted as   #
+   # multi-line values.  Prints width-adjusted output on the current output    #
+   # stream as follows:                                                        #
+   #                                                                           #
+   #   heading0          heading1               <- column headings             #
+   #   ----------------- ---------------------  <- automatic separator         #
+   #   value0.1          value1.1               <- string values               #
+   #   value0.2.0        value1.2               <- ARRAYREF on the left        #
+   #   value0.2.1                                                              #
+   #   value0.2.2                                                              #
+   #                     value1.3               <- extra values on the right   #
+   #---------------------------------------------------------------------------#
+{
+   my @widths = map (&column_width (@$_), @_);
+   my $fmt = 'A'.join ('A', map ($_+1, @widths));
+   $fmt =~ s/A\d+$/A*/;   # replace last width with '*'
+   my $n = (sort {$b <=> $a} map (scalar (@$_), @_)) [0];
+   my $nn;
+   my @rc;
+
+   for $i (0..$n-1) {
+      $nn = (sort {$b <=> $a} map (ref $_->[$i] eq 'ARRAY' ?
+                                      scalar (@{$_->[$i]}) : 1,
+                                   @_)) [0];
+      for $ii (0..$nn-1) {
+         push @rc, pack ($fmt, map (ref ($_->[$i]) eq 'ARRAY'
+                                    ? $_->[$i]->[$ii]
+                                    : $ii ? '' : $_->[$i], @_));
+      }
+      push @rc, pack ($fmt, map ('-' x $_, @widths)) if $i == 0;
+   }
+
+   return @rc;
+}
+
+#==============================================================================#
+#                                   d u m p                                    #
+#==============================================================================#
+
+sub dump
+   #---------------------------------------------------------------------------#
+   # usage 1: @output = &dump ($buf);                                          #
+   # usage 2: &dump ($buf, FILE);                                              #
+   #                                                                           #
+   # Formats $buf as a sequence of dump lines representing 16 bytes each:      #
+   #    xxxx |00112233 44556677 8899AABB CCDDEEFF|*|0123456789ABCDEF|          #
+   # where "xxxx" is the hex offset of the current line (0000, 0010, etc.) and #
+   # the remainder of the line displays the hex and ASCII interpretation of    #
+   # the sixteen bytes starting from that offset.  Unprintable characters are  #
+   # converted to "." for ASCII display.  The last line of the dump may        #
+   # contain fewer than 16 characters, depending on the length of $buf.  If    #
+   # FILE is present, usage 2 is assumed and output is written to FILE.        #
+   # Otherwise, the output lines are stacked into an array and returned.       #
+   #---------------------------------------------------------------------------#
+{
+   my $buffer = shift @_;
+   my $fh     = shift @_;
+
+   my $i      = 0;
+   my $len    = length ($buffer);
+   my $lspec  = $len>0xFFFFFF ? '%8.8lX' : $len>0xFFFF ? '%6.6lX' : '%4.4lX';
+   my @ldata;
+   my $adata;
+
+   my @result;
+
+   while ($i+16 <= $len) {
+      $adata = substr ($buffer, $i, 16);
+      @ldata = unpack ('N4', $adata);
+      $adata =~ tr/\x00-\x1F\x7F-\xFF/./;
+      if ($fh) {
+         printf $fh "$lspec |%8.8lX %8.8lX %8.8lX %8.8lX|*|%s|\n",
+                    $i, @ldata, $adata;
+      } else {
+         push (@result, sprintf "%4.4lX |%8.8lX %8.8lX %8.8lX %8.8lX|*|%s|",
+                        $i, @ldata, $adata);
+      }
+      $i += 16;
+   }
+
+   if ($i < $len) {
+      $adata = substr ($buffer, $i);
+      @ldata = unpack ('C*', $adata);
+      grep (($_ = sprintf ('%2.2X', $_)) && 0, @ldata);
+      push (@ldata, split (':', '  ' . (':  ' x (15 - $len + $i))));
+      $adata =~ tr/\x00-\x1F\x7F-\xFF/./;
+      if ($fh) {
+         printf $fh "$lspec |%s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s|*|%s|\n",
+                    $i, @ldata, pack ('A16', $adata);
+      } else {
+         push (@result,
+               sprintf "$lspec |%s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s|*|%s|",
+                       $i, @ldata, pack ('A16', $adata));
+      }
+   }
+   return @result;
+}
+
+#==============================================================================#
+#                            a s n 1   p a r s e r                             #
+#==============================================================================#
+
+%asn_class = ( 0 => {name => 'universal',          x => ''},
+               1 => {name => 'application',        x => 'a'},
+               2 => {name => 'context-specific',   x => ''},
+               3 => {name => 'private',            x => 'p'},
+             );
+%asn_utag  = ( 0 => {name => 'end of contents',    x => '!'},
+               1 => {name => 'boolean',            x => 'f', t => 'f'},
+               2 => {name => 'integer',            x => 'i', t => 'i'},
+               3 => {name => 'bit string',         x => 'b', t => 'b'},
+               4 => {name => 'octet string',       x => 'o'},
+               5 => {name => 'null',               x => 'x', t => 'x'},
+               6 => {name => 'object identifier',  x => 'd', t => 'd'},
+               7 => {name => 'object descriptor',  x => '!'},
+               8 => {name => 'external',           x => '!'},
+               9 => {name => 'real',               x => '!'},
+              10 => {name => 'enumerated',         x => 'e', t => 'i'},
+              12 => {name => 'utf8 string',        x => '8', t => 'p'},
+              16 => {name => 'sequence',           x => 'q'},
+              17 => {name => 'set',                x => 's'},
+              18 => {name => 'numeric string',     x => '9', t => 'p'},
+              19 => {name => 'printable string',   x => 'p', t => 'p'},
+              20 => {name => 't61 string',         x => 't', t => 'p'},
+              21 => {name => 'videotex string',    x => '!', t => 'p'},
+              22 => {name => 'ia5 string',         x => 'a', t => 'p'},
+              23 => {name => 'utc time',           x => 'u', t => 'p'},
+              24 => {name => 'generalized time',   x => 'z', t => 'p'},
+              25 => {name => 'graphic string',     x => '!'},
+              26 => {name => 'visible string',     x => 'v', t => 'p'},
+              27 => {name => 'general string',     x => '!', t => 'p'},
+              28 => {name => 'universal string',   x => '!', t => 'p'},
+              30 => {name => 'bmp string',         x => '!', t => 'p'},
+              -1 => {name => 'parsing error',      x => '!'},
+             );
+
+sub asn_parse_header
+   #---------------------------------------------------------------------------#
+   # usage: ($class, $cons, $tag, $len) =                                      #
+   #           &asn_parse_header (\$buf, \$off, $max);                         #
+   #                                                                           #
+   # input:  $buf    is a reference to the DER/BER encoded buffer              #
+   #         $off    is a reference to the current offset in $buf              #
+   #         $max    is the length of $buf starting from 0 (not from $$off)    #
+   #                                                                           #
+   # output: $class  is the asn.1 class found (0 to 3)                         #
+   #         $cons   is a flag (0 for primitive, 1 for constructed)            #
+   #         $tag    is the asn.1 tag found (a non-negative integer)           #
+   #         $len    is the length of the contents octets                      #
+   #                                                                           #
+   #         As part of the header parse, the parsing offset $$off is updated  #
+   #         to skip over the octets consumed while parsing the header (at     #
+   #         least two, but perhaps more for large tags or lengths).           #
+   #                                                                           #
+   #         The error conditions are related to running out of room at $max,  #
+   #         indicating an invalid asn.1 encoding.  If the header bytes can    #
+   #         can not be fully parsed, $tag is set to -1, $len is set to 0, and #
+   #         $$off is updated to $max.  If $len, on the other hand, is found   #
+   #         to extend the contents octets beyond $max, $tag is set to -1,     #
+   #         $len is set to the remaining valid length, and $off points to the #
+   #         start of the (apparently truncated) contents.                     #
+   #---------------------------------------------------------------------------#
+{
+   my $pbuf = shift @_;
+   my $poff = shift @_;
+   my $max  = shift @_;
+
+   #------------------------------------------#
+   # First octet: class, constructed, and tag #
+   #------------------------------------------#
+   return (0, 0, -1, 0) if $max-$$poff < 1;
+   my $t0 = ord (substr ($$pbuf, ${$poff}++, 1));
+   my $class = $t0 >> 6;
+   my $cons  = ($t0 >> 5) & 1;
+   my $tag   = $t0 & 0x1F;
+
+   #---------------#
+   # High-tag form #
+   #---------------#
+   if ($tag == 31) {
+      $tag = unpack ('w', substr ($$pbuf, $$poff)); 
+      1 while $$poff<$max and ord (substr ($$pbuf, ${$poff}++, 1)) < 128;
+   }
+
+   #----------------------#
+   # Second octet: length #
+   #----------------------#
+   return (0, 0, -1, 0) if $max-$$poff < 1;
+   my $len = ord (substr ($$pbuf, ${$poff}++, 1));
+   if ($len == 0x80) {
+      #-------------------#
+      # Indefinite length #
+      #-------------------#
+      my ($class, $cons, $tag, $llen, $off);
+      $off = $$poff;
+      do {
+         ($class, $cons, $tag, $llen) = &asn_parse_header ($pbuf, \$off, $max);
+         $off += $llen;
+      } while ($class+$cons+$tag+$llen > 0) and $off < $max;
+      $len = $off - $$poff;
+   } elsif ($len > 0x80) {
+      #-----------#
+      # Long-form #
+      #-----------#
+      my $llen = $len - 0x80;
+      $len = 0;
+      while ($llen-- and $$poff < $max) {
+         $len = (256 * $len) + ord (substr ($$pbuf, ${$poff}++, 1));
+      }
+   }
+   #--------------------------------------------------------------#
+   # Check for silly lengths against $max:                        #
+   #   If len + current offset exceeds max, we will eventually    #
+   #   have a problem.  Instead of returning a parsing error      #
+   #   right away, if this is a constructed type with at least    #
+   #   2 bytes (enough for a NULL) left after the current offset, #
+   #   we'll let it pass and see how far we get.  Otherwise, now  #
+   #   is the time to return the parsing error.                   #
+   #--------------------------------------------------------------#
+   return (0, 0, -1, $max-$$poff) if $len > $max-$$poff
+                                  and (!$cons or $max-$$poff < 2);
+
+   #---------#
+   # Results #
+   #---------#
+   return ($class, $cons, $tag, $len);
+}
+
+sub asn_header
+   #---------------------------------------------------------------------------#
+   # usage: $asn = &asn_header ($class, $cons, $tag, $len);                    #
+   #                                                                           #
+   # Returns a DER-encoded ASN.1 header for the class, constructed flag, tag,  #
+   # and content length specified.                                             #
+   #---------------------------------------------------------------------------#
+{
+   my $class = shift @_;
+   my $cons  = shift @_;
+   my $tag   = shift @_;
+   my $len   = shift @_;
+
+   my $atag;
+   my $alen;
+
+   if ($tag > 30) {
+      $atag = pack ('w', $tag);
+      $tag  = 31;
+   }
+   if ($len > 127) {
+      $alen = pack ('N', $len);
+      $alen =~ s/^\x00+//;
+      $len  = 128 + length ($alen);
+   }
+   return pack ('ca*ca*', ($class<<6)+($cons<<5)+$tag, $atag, $len, $alen);
+}
+
+sub asn_disguised_asn
+   #---------------------------------------------------------------------------#
+   # usage: if (&asn_disguised_asn (\$buf, $tag, \$off, \$len, $max)) {        #
+   #                                                                           #
+   # input:  $buf    is a reference to the DER/BER encoded buffer              #
+   #         $tag    is the tag from asn_parse_header                          #
+   #         $off    is a reference to the offset of the contents octets       #
+   #         $len    is a reference to the length of the contents octets       #
+   #         $max    is the length of $buf starting from 0 (not from $$off)    #
+   #                                                                           #
+   #         Before calling asn_disguised_asn, the caller should already have  #
+   #         checked that the class is 0 (universal) and the $tag is 3 or 4    #
+   #         (bit string or octet string).  Constructed string encodings are   #
+   #         not supported (only DER), so the caller should also check that    #
+   #         the encoding is not constructed.                                  #
+   #                                                                           #
+   # output: 1       if the contents "look" like nested asn.1 buried in a bit  #
+   #                 string or octet string.  "look" means that there is a     #
+   #                 valid asn.1 header whose length aligns perfectly with the #
+   #                 end of the bit or octet string.  If a match is made for a #
+   #                 bit string, $off and $len are adjusted by 1 to account    #
+   #                 for the unused bits octet at the start of the bit string. #
+   #         undef   if it is nothing special.                                 #
+   #---------------------------------------------------------------------------#
+{
+   my $pbuf  = shift @_;
+   my $tag   = shift @_;
+   my $poff  = shift @_;
+   my $plen  = shift @_;
+   my $max   = shift @_;
+
+   my $off = $$poff;
+   my $len = $$plen;
+   $off++, $len-- if $tag == 3;  # skip BIT STRING extra byte
+   return undef if $off+$len > $max;
+
+   my $toff = $off;
+   my ($tclass, $tcons, $ttag, $tlen);
+
+   ($tclass, $tcons, $ttag, $tlen) = &asn_parse_header ($pbuf, \$toff, $max);
+   if ($ttag > 0 and $off + $len == $toff + $tlen) {
+      $$poff = $off;
+      $$plen = $len;
+      return 1;
+   }
+   return undef;
+}
+
+sub asn_string
+   #---------------------------------------------------------------------------#
+   # usage: if (&asn_string ($buf)) { ... }                                    #
+   #                                                                           #
+   # A short-hand version of &asn_disguised_asn intended to examine an entire  #
+   # string to see if it looks like an ASN.1 structure.                        #
+   #---------------------------------------------------------------------------#
+{
+   my ($class, $cons, $tag, $len, $off);
+   $off = 0;
+   ($class, $cons, $tag, $len) =
+      &asn_parse_header (\$_[0], \$off, length ($_[0]));
+   return 1 if $tag > 0 and $off+$len == length ($_[0]);
+   return undef;
+}
+
+sub asn_parse
+   #---------------------------------------------------------------------------#
+   # usage: $hashref = &asn_parse ($bufref, $offref, $max);                    #
+   #                                                                           #
+   # input: $bufref is a reference to the DER/BER encoded buffer               #
+   #        $offref is a reference to the current parsing offset in $bufref    #
+   #        $max    is the offset of the end of $bufref + 1                    #
+   # note:  $offref starts off pointing to a 0, $max starts as the buffer len  #
+   #                                                                           #
+   # output: an arrayref, each element a hashref as follows:                   #
+   #         $hashref->{class} = class (0 to 3)                                #
+   #         $hashref->{cons}  = constructed flag (0 to 2):                    #
+   #                             0 for primitive types                         #
+   #                             1 for constructed types                       #
+   #                             2 for primitives treated as constructed       #
+   #         $hashref->{tag}   = tag number                                    #
+   #         $hashref->{off}   = buffer offset of the contents                 #
+   #         $hashref->{len}   = length of the contents                        #
+   #         $hashref->{hlen}  = length of header (tag and length) octets      #
+   #         $hashref->{a}     = arrayref of more hashrefs of the contents     #
+   #---------------------------------------------------------------------------#
+{
+   my $pbuf = shift @_;
+   my $poff = shift @_;
+   my $max  = shift @_;
+
+   my ($class, $cons, $tag, $off, $len);
+
+   my $a    = [];
+   my $ha;
+
+   while ($$poff < $max) {
+      $off = $$poff;
+      ($class, $cons, $tag, $len) = &asn_parse_header ($pbuf, $poff, $max);
+      $cons = 2 if $class == 0 and !$cons and ($tag == 3 or $tag == 4) and
+                   &asn_disguised_asn ($pbuf, $tag, $poff, \$len, $max);
+      $ha = {class => $class,
+             cons  => $cons,
+             tag   => $tag,
+             off   => $$poff,
+             len   => $len,
+             hlen  => $$poff-$off};
+      if ($cons) {
+         my $consmax = $$poff+$len;
+         my $err     = $consmax > $max;
+         $consmax = $max if $err;
+         $ha->{a} = &asn_parse ($pbuf, $poff, $consmax);
+         push (@{$ha->{a}}, {class => 0,
+                             cons  => 0,
+                             tag   => -1,
+                             off   => $$poff,
+                             len   => 0,
+                             hlen  => 0})
+            if 0 and $err;
+      } else {
+         $$poff += $len;
+      }
+      push (@$a, $ha);
+   }
+   return $a;
+}
+
+#==============================================================================#
+#                         a s n 1   f o r m a t t e r                          #
+#==============================================================================#
+
+sub asn_format_tag
+   #---------------------------------------------------------------------------#
+   # usage: $string = &asn_format_tag ($ha);                                   #
+   #                                                                           #
+   # input: $ha    is a reference to a parse entry hash                        #
+   #                                                                           #
+   # output: a text interpretation of its tag.  For universal types known to   #
+   #         the program (see %asn_utag), this is a name.  Other universal     #
+   #         types are rendered as the number.  Other classes are rendered as  #
+   #            context-specific: [number]                                     #
+   #            application:      a[number]                                    #
+   #            private:          p[number]                                    #
+   #---------------------------------------------------------------------------#
+{
+   my $ha = shift @_;
+
+   if (!$ha->{class}) {
+      return $asn_utag{$ha->{tag}}->{name} || $ha->{tag};
+   } else {
+      return $asn_class{$ha->{class}}->{x}."[$ha->{tag}]";
+   }
+}
+
+sub asn_format_prim
+   #---------------------------------------------------------------------------#
+   # usage: $string = &asn_format_prim ($ha, \$buf, $raw);                     #
+   #                                                                           #
+   # input: $ha     is a reference to a parse entry hash                       #
+   #        \$buf   is a reference to the buffer where the value is stored     #
+   #        $raw    means suppress interpretation.  For now, this only affects #
+   #                OIDs.                                                      #
+   #                                                                           #
+   # output: a text interpretation of the contents octets represented by $ha.  #
+   #         For some binary types or long values, this may be a multi-line    #
+   #         string including "\n"s.  Returns undef if there is no value for   #
+   #         this type (e.g. EOC, but not NULL).                               #
+   #---------------------------------------------------------------------------#
+{
+   my $ha   = shift @_;
+   my $pbuf = shift @_;
+   my $raw  = shift @_;
+
+   my $tag = $ha->{class} ? 4 : $ha->{tag};
+   my $off = $ha->{off};
+   my $len = $ha->{len};
+
+   if ($tag <= 0) {
+      #----------------------#
+      # EOC or parsing error #
+      #----------------------#
+      return undef;
+   } elsif ($asn_utag{$tag}->{t} eq 'f' and $len == 1) {
+      #---------#
+      # BOOLEAN #
+      #---------#
+      my $bool = ord (substr ($$pbuf, $off, 1));
+      return sprintf ($bool ? 'TRUE (0x%.2x)' : 'FALSE (0x%.2x)', $bool);
+   } elsif ($asn_utag{$tag}->{t} eq 'i' and $len <= 4) {
+      #----------------------------------#
+      # INTEGER or ENUMERATED <= 32 bits #
+      #----------------------------------#
+      my $i = 0;
+      for $x (0 .. $len-1) {
+         $i = ($i << 8) + ord (substr ($$pbuf, $off+$x, 1));
+      }
+      return sprintf ('0x%x (%d)', $i, $i);
+   } elsif ($asn_utag{$tag}->{t} eq 'd') {
+      #-------------------#
+      # OBJECT IDENTIFIER #
+      #-------------------#
+      my @oid = unpack ('w*', substr ($$pbuf, $off, $len));
+      my $oid0 = shift @oid;
+      unshift (@oid, int ($oid0 / 40), $oid0 % 40);
+      my $dio;
+      my $oid;
+      my $oid_raw = join ('.', @oid);
+      return $oid_raw if $raw == 1;
+      while (@oid) {
+         $oid = join ('.', @oid);
+         if ($OID{$oid}) {
+            return $OID{$oid} . $dio if $raw == 2;
+            return "$OID{$oid}$dio ($oid_raw)";
+         }
+         $dio = '.' . pop (@oid) . $dio;
+      }
+      return substr ($dio, 1);
+   } elsif ($asn_utag{$tag}->{t} eq 'p') {
+      #------------------------#
+      # any STRING or any TIME #
+      #------------------------#
+      return substr ($$pbuf, $off, $len);
+      # return '"' . substr ($$pbuf, $off, $len) . '"';
+   } elsif ($asn_utag{$tag}->{t} eq 'x' or $len == 0) {
+      #------#
+      # NULL #
+      #------#
+      return 'NULL';
+   } elsif ($asn_utag{$tag}->{t} eq 'b' and $len <= 3) {
+      #------------------#
+      # short BIT STRING #
+      #------------------#
+      my $unused = ord (substr ($$pbuf, $off, 1));
+      my $vec    = substr ($$pbuf, $off+1, $len-1);
+      return unpack ("B".(8*($len-1)-$unused), $vec);
+   } else {
+      #--------------#
+      # just dump it #
+      #--------------#
+      return "\n".
+             join ("\n",
+                   grep s/^/               /,
+                   &dump (substr ($$pbuf, $off, $len)));
+   }
+}
+
+sub asn_format_short
+{
+   my $ha   = shift @_;
+   my $pbuf = shift @_;
+
+   if ($ha->{fmt}) {
+      return &{$ha->{fmt}} ($ha, $pbuf);
+   } else {
+      my $prim = &asn_format_prim ($ha, $pbuf);
+      if ($prim =~ /^\n/) {
+         return '' if $ha->{a};
+         my $result = [];
+         push (@$result, split ("\n", substr ($prim, 1)));
+         grep {s/^\s+//} @$result;
+         return $result;
+      } else {
+         return $prim;
+      }
+   }
+}
+
+sub asn_format_info
+{
+   my $ha    = shift @_;
+   my $pbuf  = shift @_;
+   my $pad   = shift @_;
+
+   my $info = sprintf ('%5d:%1d:%-5d ', $ha->{off}-$ha->{hlen},
+                                        $ha->{hlen},
+                                        $ha->{len}).
+              " $pad".
+              $ha->{name}.
+              ($ha->{name} ? ':' : '').
+              &asn_format_tag ($ha);
+   if (!$ha->{cons}) {
+      my $prim = &asn_format_prim ($ha, $pbuf);
+      $info .= " = $prim" if $prim;
+   }
+   return $info;
+}
+
+sub asn_format
+   #---------------------------------------------------------------------------#
+   # usage: &asn_format ($asn, $pbuf, $pad);                                   #
+   #                                                                           #
+   # input: $asn    as returned from &asn_parse, an ARRAYREF of parse entries  #
+   #        $pbuf   as input to &asn_parse                                     #
+   #        $pad    (optional) formatting pad string                           #
+   #---------------------------------------------------------------------------#
+{
+   my $asn  = shift @_;
+   my $pbuf = shift @_;
+   my $pad  = shift @_;
+
+   my @rc;
+   my $i    = 0;
+   for $ha (@$asn) {
+      my $subpad = $pad.($ha->{cons}==2?'+ ':'. ');
+      push @rc, &asn_format_info ($ha, $pbuf, $pad);
+      if (defined ($ha->{a})) {
+         push @rc, &asn_format ($ha->{a}, $pbuf, $subpad);
+      }
+      $i++;
+   }
+   return @rc;
+}
+
+sub asn_clear_names
+   #---------------------------------------------------------------------------#
+   # usage: &asn_clear_names ($asn);                                           #
+   #                                                                           #
+   # Clears all the display name and formatter pointers in $asn (usually after #
+   # a failed &asn_match).                                                     #
+   #---------------------------------------------------------------------------#
+{
+   my $asn = shift @_;
+
+   for $ha (@$asn) {
+      delete $ha->{name} if $ha->{name};
+      delete $ha->{fmt}  if $ha->{fmt};
+      &asn_clear_names ($ha->{a}) if $ha->{a};
+   }
+}
+
+#==============================================================================#
+#                 a s n 1   c u s t o m   f o r m a t t e r s                  #
+#==============================================================================#
+
+#------------------------------------------------------------------------------#
+# usage 1: $string  = &fmt_xxx ($ha, $pbuf);  <- returning a string            #
+# usage 2: $strings = &fmt_xxx ($ha, $pbuf);  <- returning an ARRAYREF         #
+#                                                                              #
+# Formats the parse entry $ha parsed from $pbuf according to rules for _xxx    #
+# type things.  If the formatted value fits on a single line, a string is      #
+# returned (usage 1).  Otherwise, for multi-line values, an ARRAYREF of        #
+# strings is returned (see &column_print for a hint as to why).                #
+#------------------------------------------------------------------------------#
+
+sub fmt_name
+{
+   my $ha   = shift @_;
+   my $pbuf = shift @_;
+
+   my $name = [];
+
+   for $rdn (@{$ha->{a}}) {
+      for $av (@{$rdn->{a}}) {
+         push (@$name, &asn_format_short ($av->{a}->[0], $pbuf)
+                       .'='.
+                       &asn_format_short ($av->{a}->[1], $pbuf));
+      }
+   }
+
+   return $name;
+}
+
+sub fmt_string
+{
+   my $ha   = shift @_;
+   my $pbuf = shift @_;
+   return substr ($$pbuf, $ha->{off}, $ha->{len});
+}
+
+sub fmt_hex
+{  return '0x'.&encode_hex (&fmt_string (@_));  }
+sub fmt_822
+{  return 'rfc822='.&fmt_string (@_);  }
+sub fmt_dns
+{  return 'dns='.&fmt_string (@_);  }
+sub fmt_uri
+{  return 'uri='.&fmt_string (@_);  }
+sub fmt_oid
+{  return 'oid='.&fmt_string (@_);  }
+
+@fmt_keyusage = ('digitalSignature',
+                 'nonRepudiation',
+                 'keyEncipherment',
+                 'dataEncipherment',
+                 'keyAgreement',
+                 'keyCertSign',
+                 'cRLSign',
+                 'encipherOnly',
+                 'decipherOnly',
+                );
+sub fmt_keyusage
+{
+   my $ha   = shift @_;
+   my $pbuf = shift @_;
+   my @bits = split (//, &asn_format_prim ($ha, $pbuf));
+   my $usage = [];
+
+   for $i (0..$#bits) {
+      push (@$usage, $fmt_keyusage[$i]) if $bits[$i] eq '1';
+   }
+   return $usage;
+}
+
+@fmt_ns_certtype = ('SSLClient',
+                    'SSLServer',
+                    'Email',
+                    'SSLCA',
+                    'EmailCA',
+                   );
+sub fmt_ns_certtype
+{
+   my $ha   = shift @_;
+   my $pbuf = shift @_;
+   my @bits = split (//, &asn_format_prim ($ha, $pbuf));
+   my $usage = [];
+
+   for $i (0..$#bits) {
+      push (@$usage, $fmt_ns_certtype[$i]) if $bits[$i] eq '1';
+   }
+   return $usage;
+}
+
+#==============================================================================#
+#                      a s n 1   s y m b o l   t a b l e                       #
+#==============================================================================#
+
+#------------------------------------------------------------------------------#
+# ASN.1 parse matching                                                         #
+#                                                                              #
+# The entries in %asn_pats are based on a pattern matching entry that models   #
+# the parse entry returned by asn_parse.  Each matching entry contains a class #
+# and tag, against which the parse entry is compared.  A variety of additional #
+# fields control how the contents of constructed types (SEQUENCEs and SETs)    #
+# are matched further against the {a} field of the parse entry.  The pattern   #
+# matching fields are:                                                         #
+#    t    => the tag                                                           #
+#    tt   => the "true tag" for implicit tags (usually cl=>2) (not used yet)   #
+#    cl   => the class (optional, defaults to 0 = universal)                   #
+#    cons => constructed matching: an ARRAYREF of entries to match against {a} #
+#    of   => 1 for SEQUENCE or SET OF: keep reusing cons while matching        #
+#    name => a name for this match (optional)                                  #
+#    opt  => 1 for optional elements                                           #
+#    fmt  => a short formatting routing (see fmt_xxx and asn_format_short)     #
+#                                                                              #
+# These pattern matching entries are typically listed in an ARRAYREF since we  #
+# are usually matching the {cons} array from an outer type against the {a}     #
+# from a parsing entry (all interesting ASN.1 types are SEQUENCEs at the outer #
+# layer, it seems).  This means that the named entries in %asn_pats are all    #
+# enclosed in a seemingly useless ARRAYREF with one element, but it makes the  #
+# nested handling more consistent (ok, I'll fix it later).                     #
+#                                                                              #
+# CHOICEs require special mention: when there is a CHOICE, instead of a        #
+# pattern matching HASHREF, you find instead an ARRAYREF of the HASHREFs       #
+# representing the choices.  ASN.1 requires the tag/class of CHOICEs to be     #
+# distinct, so this works out ok.  Also, for "don't care" or ANY matching, you #
+# can use t=>0 (and cl=>0 or unspecified).  While 0,0 is really EndOfContents  #
+# for indefinite-length encoding, these things are never matched, so I have    #
+# borrowed 0,0 for ANY.                                                        #
+#                                                                              #
+# There are also a couple of naming tricks: inside of an of=>1 cons, you can   #
+# use a name of '#', which will be replaced with the 0-relative index of the   #
+# matched entry (cert.0, cert.1, etc.).  A related trick allows '#.name',      #
+# which means use '#'-style number naming first, but then look for a value in  #
+# '.name' in the cons of the current match entry, and add an alias using that  #
+# value in addition to the number name.  This is used for extensions, so I can #
+# say "cert.tbs.extn.extKeyUsage" without knowing that it is really extn.5 or  #
+# whatever in this particular cert.                                            #
+#                                                                              #
+# Sorry this is so ugly, but it basically works.                               #
+#------------------------------------------------------------------------------#
+
+%asn_pats = (
+   #---------------------------------------------------------------------------#
+   # Catch-all for unformatted output                                          #
+   #---------------------------------------------------------------------------#
+   raw =>
+      [{t=>0},
+      ],
+   #---------------------------------------------------------------------------#
+   # PKIX                                                                      #
+   #---------------------------------------------------------------------------#
+   name =>
+      [{t=>16, of=>1, cons=> 'rdn',  fmt=>\&fmt_name},
+      ],
+   rdn =>
+      [{t=>17, of=>1, cons=> 'nameav'},
+      ],
+   nameav =>
+      [{t=>16, cons=>
+         [{t=> 6},
+          {t=> 0},
+         ]},
+      ],
+   'general-name' =>
+      [[{t=> 1, cl=>2, tt=>22,       name=>'rfc822', fmt=>\&fmt_822},
+        {t=> 2, cl=>2, tt=>22,       name=>'dns',    fmt=>\&fmt_dns},
+        {t=> 4, cl=>2, cons=>'name', name=>'name'},
+        {t=> 6, cl=>2, tt=>22,       name=>'uri',    fmt=>\&fmt_uri},
+        {t=> 8, cl=>2, tt=> 6,       name=>'oid',    fmt=>\&fmt_oid},
+        {t=> 0,                      name=>'other'},
+      ]],
+   alg =>
+      [{t=>16, cons=>
+         [{t=> 6,                    name=>'id'},
+          {t=> 0,            opt=>1, name=>'parms'},
+         ]},
+      ],
+   time =>
+      [[{t=>23},
+        {t=>24},
+      ]],
+   extn =>
+      [{t=>16,                       cons=>
+         [{t=> 6,                    name=>'id'},
+          {t=> 1, opt=>1,            name=>'critical'},
+          [{t=>'.id'                 },
+           {t=> 4,                   name=>'value'},
+          ],
+         ]},
+      ],
+   pubkey =>
+      [{t=>16, cons=>
+         [{t=> 'alg',                name=>'alg'},
+          {t=> 3,                    name=>'key', cons=>
+            [{t=>16,                 cons=>
+               [{t=> 2,              name=>'n'},
+                {t=> 2,              name=>'e'},
+               ]},
+            ]},
+         ]},
+      ],
+   cert =>
+      [{t=>16, cons=>
+         [{t=>16,                    name=>'tbs', cons=>
+            [{t=> 0, cl=>2,  opt=>1, cons=>
+               [{t=> 2,              name=>'v'},
+               ]},
+             {t=> 2,                 name=>'sn'},
+             {t=>'alg',              name=>'alg'},
+             {t=>'name',             name=>'issuer'},
+             {t=>16,                 name=>'valid', cons=>
+               [{t=>'time',          name=>'from'},
+                {t=>'time',          name=>'to'},
+               ]},
+             {t=>'name',             name=>'subject'},
+             {t=>'pubkey',           name=>'pubkey'},
+             {t=> 1, cl=>2,  opt=>1, name=>'issuerID'},
+             {t=> 2, cl=>2,  opt=>1, name=>'subjectID'},
+             {t=> 3, cl=>2,  opt=>1, cons=>
+               [{t=>16,              name=>'extn', of=>1, cons=>
+                  [{t=>'extn',       name=>'#.id'},
+                  ]},
+               ]},
+            ]},
+          {t=> 'alg',                name=>'alg'},
+          {t=> 3,                    name=>'sig'},
+         ]},
+      ],
+   crl =>
+      [{t=>16, cons=>
+         [{t=>16,                    name=>'tbs', cons=>
+            [{t=> 2,         opt=>1, name=>'v'},
+             {t=>'alg',              name=>'alg'},
+             {t=>'name',             name=>'issuer'},
+             {t=>'time',             name=>'this'},
+             {t=>'time',     opt=>1, name=>'next'},
+             {t=>16,         opt=>1, name=>'cert', of=>1, cons=>
+               [{t=>16,              name=>'#', cons=>
+                  [{t=> 2,           name=>'sn'},
+                   {t=>'time',       name=>'revoked'},
+                   {t=>16,   opt=>1, name=>'extn', of=>1, cons=>
+                     [{t=>'extn',    name=>'#.id'},
+                     ]},
+                  ]},
+               ]},
+             {t=> 0, cl=>2,  opt=>1, cons=>
+               [{t=>16,              name=>'extn', of=>1, cons=>
+                  [{t=>'extn',       name=>'#.id'},
+                  ]},
+               ]},
+            ]},
+          {t=> 'alg',                name=>'alg'},
+          {t=> 3,                    name=>'sig'},
+         ]},
+      ],
+   #---------------------------------------------------------------------------#
+   # Extensions                                                                #
+   #---------------------------------------------------------------------------#
+   '1.3.6.1.5.5.7.1.1' => # authorityInfoAccess
+      [{t=> 4,                       cons=>
+         [{t=>16, of=>1,             name=>'desc', cons=>
+            [{t=>16,                 name=>'#',    cons=>
+               [{t=> 6,              name=>'method'},
+                {t=>'general-name',  name=>'location'},
+               ]},
+            ]},
+         ]},
+      ],
+   '2.5.29.14' => # subjectKeyIdentifier
+      [{t=> 4,                       cons=>
+         [{t=> 4,                    name=>'subjectKeyId', fmt=>\&fmt_hex},
+         ]},
+      ],
+   '2.5.29.15' => # keyUsage
+      [{t=> 4,                       cons=>
+         [{t=> 3,                    name=>'keyUsage', fmt=>\&fmt_keyusage},
+         ]},
+      ],
+   '2.5.29.16' => # privateKeyUsage
+      [{t=> 4,                       cons=>
+         [{t=>16,                    name=>'privateKeyUsage', cons=>
+            [{t=> 0, cl=>2, opt=>1,  name=>'from', fmt=>\&fmt_string},
+             {t=> 1, cl=>2, opt=>1,  name=>'to',   fmt=>\&fmt_string},
+            ]},
+         ]},
+      ],
+   '2.5.29.17' => # subjectAltName
+      [{t=> 4,                       cons=>
+         [{t=>16, of=>1,             name=>'name', cons=>
+            [{t=>'general-name',     name=>'#'},
+            ]},
+         ]},
+      ],
+   '2.5.29.19' => # basicConstraints
+      [{t=> 4,                       cons=>
+         [{t=>16,                    name=>'basicConstraints', cons=>
+            [{t=> 1, opt=>1,         name=>'ca'},
+             {t=> 2, opt=>2,         name=>'pathlen'},
+            ]},
+         ]},
+      ],
+   '2.5.29.31' => # cRLDistributionPoints
+      [{t=> 4,                       cons=>
+         [{t=>16, of=>1,             name=>'dp', cons=>
+            [{t=>16,                 name=>'#', cons=>
+               [{t=> 0, opt=>1,      name=>'name', cons=>
+                  [[{t=> 0,          name=>'full', cons=>
+                     [{t=>'general-name'},
+                     ]},
+                    {t=> 1,          name=>'rdn', cons=>
+                     [{t=>'rdn'      },
+                     ]},
+                   ]
+                  ]},
+                {t=> 1, opt=>1,      name=>'flags'},
+                {t=> 2, opt=>1, of=>1, name=>'issuer', cons=>
+                  [{t=>'general-name', name=>'#'},
+                  ]},
+               ]},
+            ]},
+         ]},
+      ],
+   '2.5.29.32' => # certificatePolicies
+      [{t=> 4,                       cons=>
+         [{t=>16, of=>1,             name=>'policy', cons=>
+            [{t=>16,                 name=>'#', cons=>
+               [{t=> 6,              name=>'id'},
+                {t=>16, of=>1,       name=>'qualifier', cons=>
+                   [{t=>16,          name=>'#', cons=>
+                      [{t=> 6,       name=>'id'},
+                       [{t=>22,      name=>'uri'},
+                        {t=>16,      name=>'notice', cons=>
+                         [{t=>16, opt=>1, name=>'ref', cons=>
+                            [[{t=>12, name=>'text'},
+                              {t=>22, name=>'text'},     # pkix-2
+                              {t=>26, name=>'text'},
+                              {t=>30, name=>'text'},
+                             ],
+                             {t=>16, of=>1, name=>'n', cons=>
+                               [{t=> 2,     name=>'#'},
+                               ]},
+                            ]},
+                          {t=>12, opt=>1, name=>'text'},
+                          {t=>22, opt=>1, name=>'text'}, # pkix-2
+                          {t=>26, opt=>1, name=>'text'},
+                          {t=>30, opt=>1, name=>'text'},
+                         ]},
+                        {t=> 0,      name=>'other'},
+                      ]]},
+                   ]},
+               ]},
+            ]},
+         ]},
+      ],
+   '2.5.29.35' => # authorityKeyIdentifier
+      [{t=> 4,                       cons=>
+         [{t=>16,                    name=>'authorityKeyId', cons=>
+            [{t=> 0, cl=>2, opt=>1,  name=>'id',       fmt=>\&fmt_hex},
+             {t=> 1, cl=>2, opt=>1,  name=>'issuer',   fmt=>\&fmt_name},
+             {t=> 2, cl=>2, opt=>1,  name=>'sn'},
+            ]},
+         ]},
+      ],
+   '2.5.29.37' => # extKeyUsage
+      [{t=> 4,                       cons=>
+         [{t=>16, of=>1,             name=>'purpose', cons=>
+            [{t=> 6,                 name=>'#'},
+            ]},
+         ]},
+      ],
+   '2.16.840.1.113730.1.1' => # netscape-cert-type
+      [{t=> 4,                       cons=>
+         [{t=> 3,                    name=>'certType', fmt=>\&fmt_ns_certtype},
+         ]},
+      ],
+   #---------------------------------------------------------------------------#
+   # OCSP                                                                      #
+   #---------------------------------------------------------------------------#
+   'cert-id' =>
+      [{t=>16,                       cons=>
+         [{t=>'alg',                 name=>'alg'},
+          {t=> 4,                    name=>'namehash',       fmt=>\&fmt_hex},
+          {t=> 4,                    name=>'keyhash',        fmt=>\&fmt_hex},
+          {t=> 2,                    name=>'sn'},
+         ]},
+      ],
+   'ocsp-request' =>
+      [{t=>16, cons=>
+         [{t=>16,                    name=>'tbs', cons=>
+            [{t=> 0, cl=>2, opt=>1,  cons=>
+               [{t=> 2,              name=>'v'}
+               ]},
+             {t=> 1, cl=>2, opt=>1,  cons=>
+               [{t=>'general-name',  name=>'requestor'}
+               ]},
+             {t=>16, of=>1,          name=>'request', cons=>
+               [{t=>16,              name=>'#', cons=>
+                  [{t=>'cert-id',    name=>'id'},
+                   {t=> 0, cl=>2, opt=>1, cons=>
+                     [{t=>16, of=>1, name=>'extn', cons=>
+                        [{t=>'extn', name=>'#.id'},
+                        ]},
+                     ]},
+                  ]}
+               ]},
+             {t=> 2, cl=>2, opt=>1, cons=>
+               [{t=>16, of=>1, name=>'extn', cons=>
+                  [{t=>'extn', name=>'#.id'},
+                  ]},
+               ]},
+            ]},
+          {t=> 0, cl=>2, opt=>1,     cons=>
+            [{t=>16,                 name=>'sig', cons=>
+               [{t=>'alg',           name=>'alg'},
+                {t=> 3,              name=>'sig'},
+                {t=> 0, cl=>2, opt=>1, cons=>
+                  [{t=>16, of=>1,    name=>'cert', cons=>
+                     [{t=>'cert',    name=>'#'},
+                     ]},
+                  ]},
+               ]},
+            ]},
+         ]},
+      ],
+   'responder-id' =>
+      [[{t=> 1, cl=>2,               cons=>
+         [{t=>'name',                name=>'name'},
+         ]},
+        {t=> 2, cl=>2,               cons=>
+         [{t=> 4,                    name=>'key',  fmt=>\&fmt_hex},
+         ]},
+      ]],
+   'response-status' =>
+      [[{t=> 0, cl=>2,               name=>'good'},
+        {t=> 1, cl=>2,               name=>'revoked', cons=>
+         [{t=>24,                    name=>'time'},
+          {t=> 0, cl=>2, opt=>1,     cons=>
+            [{t=> 10,                name=>'reason'},
+            ]},
+         ]},
+        {t=> 2, cl=>2,               name=>'unknown'},
+      ]],
+   'ocsp-response' =>
+      [{t=>16, cons=>
+         [{t=>10,                    name=>'status'},
+          {t=> 0, cl=>2, opt=>1,     cons=>
+             [{t=>16,                cons=>
+               [{t=> 6,              name=>'type'},
+                {t=> 4,              cons=>
+                  [{t=>16,           name=>'basic', cons=>
+                     [{t=>16,        name=>'tbs', cons=>
+                        [{t=> 0, cl=>2, opt=>1, cons=>
+                           [{t=> 2,  name=>'v'},
+                           ]},
+                         {t=>'responder-id', name=>'id'},
+                         {t=>24,     name=>'at'},
+                         {t=>16,     name=>'response', of=>1, cons=>
+                           [{t=>16,  name=>'#', cons=>
+                              [{t=>'cert-id', name=>'id'},
+                               {t=>'response-status'},
+                               {t=>24,  name=>'this'},
+                               {t=> 0, cl=>2, opt=>1, cons=>
+                                 [{t=>24,  name=>'next'},
+                                 ]},
+                               {t=> 1, cl=>2, opt=>1, cons=>
+                                 [{t=>16, of=>1, name=>'extn', cons=>
+                                    [{t=>'extn', name=>'#.id'},
+                                    ]},
+                                 ]},
+                              ]},
+                           ]},
+                         {t=> 1, cl=>2, opt=>1, cons=>
+                           [{t=>16, of=>1, name=>'extn', cons=>
+                              [{t=>'extn', name=>'#.id'},
+                              ]},
+                           ]},
+                        ]},
+                      {t=>'alg',     name=>'alg'},
+                      {t=> 3,        name=>'sig'},
+                      {t=> 0, cl=>2, opt=>1, cons=>
+                        [{t=>16, of=>1, name=>'cert', cons=>
+                           [{t=>'cert', name=>'#'},
+                           ]},
+                        ]},
+                     ]},
+                  ]},
+               ]},
+            ]},
+         ]},
+      ],
+   #---------------------------------------------------------------------------#
+   # SCVP (pre-RFC draft -- not CMS)                                           #
+   #---------------------------------------------------------------------------#
+   'scvp-cert' =>
+      [[{t=>0, cl=>2,                name=>'#', cons=>
+         [{t=>'cert'},
+         ]}
+      ]],
+   'scvp-certs' =>
+      [{t=>16, of=>1,                cons=>'scvp-cert'},
+      ],
+   'scvp-query' =>
+      [[{t=>0, cl=>2,                cons=>
+         [{t=>16,                    name=>'certs-query', cons=>
+            [{t=>'scvp-certs',       name=>'cert'},
+             {t=> 0, cl=>2, opt=>1,  cons=>
+               [{t=>24,              name=>'valid'}
+               ]},
+             {t=> 1, cl=>2, opt=>1,  cons=>
+               [{t=>'scvp-certs',    name=>'intermediate'}
+               ]},
+             {t=> 2, cl=>2, opt=>1,  cons=>
+               [{t=>'scvp-certs',    name=>'trusted'}
+               ]},
+             {t=> 3, cl=>2, opt=>1,  cons=>
+               [{t=>16, of=>1, name=>'info', cons=>
+                  [{t=>'extn', name=>'#.id'},
+                  ]},
+               ]},
+             {t=> 4, cl=>2, opt=>1,  cons=>
+               [{t=>12,              name=>'policy-id'}
+               ]},
+             {t=> 4, cl=>2, opt=>1,  cons=>
+               [{t=>6,               name=>'config-id'}
+               ]},
+             {t=> 6, cl=>2, opt=>1,  cons=>
+               [{t=>16, of=>1, name=>'extn', cons=>
+                  [{t=>'extn', name=>'#.id'},
+                  ]},
+               ]},
+            ]}
+         ]},
+      ]],
+   'scvp-request' =>
+      [{t=>16, cons=>
+         [{t=>16,                    name=>'ps', cons=>
+            [{t=> 2,                 name=>'v'},
+             {t=>'scvp-query'},
+             {t=>16, of=>1,          name=>'types', cons=>
+                [{t=>6,              name=>'#'}
+                ]},
+             {t=>16, of=>1,          name=>'want', cons=>
+                [{t=>6,              name=>'#'}
+                ]},
+             {t=> 1, cl=>2, opt=>1, cons=>
+                [{t=>4,              name=>'nonce'}
+                ]},
+             {t=> 2, cl=>2, opt=>1, cons=>
+               [{t=>16, of=>1, name=>'extn', cons=>
+                  [{t=>'extn', name=>'#.id'},
+                  ]},
+               ]},
+            ]},
+          {t=> 0, cl=>2, opt=>1,     cons=>
+            [{t=>16,                 name=>'sig', cons=>
+               [{t=>'name',          name=>'name'},
+                {t=>'alg',           name=>'alg'},
+                {t=> 3,              name=>'bits'},
+                {t=> 0, cl=>2, opt=>1, cons=>'scvp-certs'},
+               ]},
+            ]},
+         ]},
+      ],
+   'scvp-reply' =>
+      [[{t=>0, cl=>2,                cons=>
+         [{t=>16, of=>1,             name=>'cert-reply', cons=>
+            [{t=>16,                 name=>'#', cons=>
+               [{t=>'scvp-cert',     name=>'cert'},
+                {t=>10,              name=>'status'},
+                {t=>24,              name=>'this'},
+                {t=> 0, cl=>2, opt=>1, cons=>
+                  [{t=>24,           name=>'next'},
+                  ]},
+                {t=> 1, cl=>2, opt=>1, cons=>
+                  [{t=>16, of=>1, name=>'types', cons=>
+                     [{t=>'extn', name=>'#.id'},
+                     ]},
+                  ]},
+                {t=> 2, cl=>2, opt=>1, cons=>
+                  [{t=>16, of=>1, name=>'want', cons=>
+                     [{t=>'extn', name=>'#.id'},
+                     ]},
+                  ]},
+                {t=> 3, cl=>2, opt=>1, cons=>
+                  [{t=>16, of=>1, name=>'extn', cons=>
+                     [{t=>'extn', name=>'#.id'},
+                     ]},
+                  ]},
+               ]},
+            ]},
+         ]},
+      ]],
+   'scvp-response' =>
+      [{t=>16, cons=>
+         [{t=>16,                    name=>'ps', cons=>
+            [{t=> 2,                 name=>'v'},
+             {t=>24,                 name=>'at'},
+             {t=>16,                 name=>'status', cons=>
+                [{t=>2,              name=>'code'},
+                 {t=>0, cl=>2, opt=>1, cons=>
+                   [{t=>12,          name=>'msg'},
+                   ]},
+                ]},
+             {t=> 4,                 name=>'hash'},
+             {t=> 0, cl=>2, opt=>1, cons=>
+                [{t=>'scvp-reply'}
+                ]},
+             {t=> 1, cl=>2, opt=>1, cons=>
+                [{t=>4,              name=>'nonce'}
+                ]},
+             {t=> 2, cl=>2, opt=>1, cons=>
+               [{t=>16, of=>1, name=>'extn', cons=>
+                  [{t=>'extn', name=>'#.id'},
+                  ]},
+               ]},
+            ]},
+          {t=> 0, cl=>2, opt=>1,     cons=>
+            [{t=>16,                 name=>'sig', cons=>
+               [{t=>'name',          name=>'name'},
+                {t=>'alg',           name=>'alg'},
+                {t=> 3,              name=>'bits'},
+                {t=> 0, cl=>2, opt=>1, cons=>'scvp-certs'},
+               ]},
+            ]},
+         ]},
+      ],
+   #---------------------------------------------------------------------------#
+   # SCVP (draft 03)                                                           #
+   #---------------------------------------------------------------------------#
+   'scvp-reply-03' =>
+      [[{t=>0, cl=>2,                cons=>
+         [{t=>16, of=>1,             name=>'cert-reply', cons=>
+            [{t=>16,                 name=>'#', cons=>
+               [{t=>'scvp-cert',     name=>'cert'},
+                {t=>10,              name=>'status'},
+                {t=>24,              name=>'this'},
+                {t=>24,              name=>'next'},
+                {t=> 0, cl=>2, opt=>1, cons=>
+                  [{t=>16, of=>1, name=>'types', cons=>
+                     [{t=>'extn', name=>'#.id'},
+                     ]},
+                  ]},
+                {t=> 1, cl=>2, opt=>1, cons=>
+                  [{t=>16, of=>1, name=>'want', cons=>
+                     [{t=>'extn', name=>'#.id'},
+                     ]},
+                  ]},
+                {t=> 2, cl=>2, opt=>1, cons=>
+                  [{t=>16, of=>1, name=>'extn', cons=>
+                     [{t=>'extn', name=>'#.id'},
+                     ]},
+                  ]},
+               ]},
+            ]},
+         ]},
+      ]],
+   'scvp-response-03' =>
+      [{t=>16, cons=>
+         [{t=>16,                    name=>'ps', cons=>
+            [{t=> 2,                 name=>'v'},
+             {t=>24,                 name=>'at'},
+             {t=>16,                 name=>'status', cons=>
+                [{t=>2,              name=>'code'},
+                 {t=>0, cl=>2, opt=>1, cons=>
+                   [{t=>12,          name=>'msg'},
+                   ]},
+                ]},
+             {t=> 4,                 name=>'hash'},
+             {t=> 0, cl=>2, opt=>1, cons=>
+                [{t=>'scvp-reply-03'}
+                ]},
+             {t=> 2, cl=>2, opt=>1, cons=>
+                [{t=>4,              name=>'nonce'}
+                ]},
+             {t=> 3, cl=>2, opt=>1, cons=>
+               [{t=>16, of=>1, name=>'extn', cons=>
+                  [{t=>'extn', name=>'#.id'},
+                  ]},
+               ]},
+            ]},
+          {t=> 0, cl=>2, opt=>1,     cons=>
+            [{t=>16,                 name=>'sig', cons=>
+               [{t=>'name',          name=>'name'},
+                {t=>'alg',           name=>'alg'},
+                {t=> 3,              name=>'bits'},
+                {t=> 0, cl=>2, opt=>1, cons=>'scvp-certs'},
+               ]},
+            ]},
+         ]},
+      ],
+   #---------------------------------------------------------------------------#
+   # ValiCert License                                                          #
+   #---------------------------------------------------------------------------#
+   'valicert-license' =>
+      [{t=>16, cons=>
+         [{t=> 2,                    name=>'v'},
+          {t=> 4,                    name=>'sn'},
+          {t=> 1,                    name=>'permanent'},
+          {t=>16, of=>1,             name=>'feature', cons=>
+            [{t=>16,                 name=>'#', cons=>
+               [{t=>22,              name=>'namespace'},
+                {t=> 4,              name=>'name'},
+                {t=> 4,              name=>'value'},
+                {t=>24, opt=>1,      name=>'expiry'},
+               ]},
+            ]},
+         ]},
+      ],
+   #---------------------------------------------------------------------------#
+   # PKCS#7                                                                    #
+   #---------------------------------------------------------------------------#
+   '1.2.840.113549.1.7.1' => # data
+      [[{t=> 4,                      cons=>'valicert-license'},
+        {t=> 4,                      name=>'data'},
+      ]],
+   '1.2.840.113549.1.7.2' => # signedData
+      [{t=>16,                       cons=>
+         [{t=> 2,                    name=>'v'},
+          {t=>17, of=>1,             name=>'digest', cons=>
+            [{t=>'alg',              name=>'#'},
+            ]},
+          {t=>'p7',                  name=>'content'},
+          {t=> 0, cl=>2, tt=>17, opt=>1, of=>1, name=>'cert', cons=>
+            [[{t=>'cert',            name=>'#'},
+              {t=>0,                 name=>'#'},
+            ]]},
+          {t=> 1, cl=>2, tt=>17, opt=>1, of=>1, name=>'crl', cons=>
+            [{t=>'crl',              name=>'#'},
+            ]},
+          {t=>17, of=>1,             name=>'signer', cons=>
+            [{t=>'signer-info',      name=>'#'},
+            ]},
+         ]},
+      ],
+   '1.2.840.113549.1.7.3' => # envelopedData
+      [{t=>16,                       cons=>
+         [{t=> 2,                    name=>'v'},
+          {t=>17, of=>1,             name=>'recipient', cons=>
+            [{t=>'recipient-info',   name=>'#'},
+            ]},
+          {t=>16,                    name=>'encrypted', cons=>
+            [{t=> 6,                 name=>'type'},
+             {t=>'alg',              name=>'alg'},
+             {t=>0, cl=>2, opt=>1,   name=>'content'},
+            ]},
+         ]},
+      ],
+   'mv-attr' =>
+      [{t=>16,                       cons=>
+         [{t=> 6,                    name=>'id'},
+          {t=>17, of=>1,             name=>'val', cons=>
+            [{t=> 0,                 name=>'#'},
+            ]},
+         ]},
+      ],
+   'signer-info' =>
+      [{t=>16,                       cons=>
+         [{t=> 2,                    name=>'v'},
+          {t=>16,                    cons=>
+             [{t=>'name',            name=>'issuer'},
+              {t=> 2,                name=>'sn'},
+             ]},
+          {t=>'alg',                 name=>'digest-alg'},
+          {t=>0, cl=>2, of=>1, opt=>1, name=>'signed', cons=>
+            [{t=>'mv-attr',          name=>'#'},
+            ]},
+          {t=>'alg',                 name=>'encryption-alg'},
+          {t=> 4,                    name=>'digest'},
+          {t=>1, cl=>2, of=>1, opt=>1, name=>'unsigned', cons=>
+            [{t=>'mv-attr',          name=>'#'},
+            ]},
+         ]},
+      ],
+   'recipient-info' =>
+      [{t=>16,                       cons=>
+         [{t=> 2,                    name=>'v'},
+          {t=>16,                    cons=>
+             [{t=>'name',            name=>'issuer'},
+              {t=> 2,                name=>'sn'},
+             ]},
+          {t=>'alg',                 name=>'key-alg'},
+          {t=> 4,                    name=>'key'},
+         ]},
+      ],
+   p7 =>
+      [{t=>16,                       cons=>
+         [{t=> 6,                    name=>'type'},
+          {t=> 0, cl=>2, opt=>1,     cons=>
+            [{t=>'.type'},
+            ]},
+         ]},
+      ],
+   #---------------------------------------------------------------------------#
+   # PKCS#10                                                                   #
+   #---------------------------------------------------------------------------#
+   p10 =>
+      [{t=>16,                       cons=>
+         [{t=>16,                    name=>'info', cons=>
+            [{t=> 2,                 name=>'v'},
+             {t=>'name',             name=>'subject'},
+             {t=>'pubkey',           name=>'pubkey'},
+             {t=> 0, cl=>2, of=>1,   name=>'attr', cons=>
+               [{t=>'mv-attr',       name=>'#.id'},
+               ]},
+            ]},
+          {t=>'alg',                 name=>'alg'},
+          {t=> 3,                    name=>'sig'},
+         ]},
+      ],
+);
+
+#                  %asn_pats key       PEM tag                #
+#                  ----------------    ---------------------  #
+%asn_auto_types = ('cert'             => 'CERTIFICATE',
+                   'crl'              => 'X509 CRL',
+                   'ocsp-request'     => 'OCSP REQUEST',
+                   'ocsp-response'    => 'OCSP RESPONSE',
+                   'scvp-request'     => 'SCVP REQUEST',
+                   'scvp-response'    => 'SCVP RESPONSE',
+                   'scvp-response-03' => 'SCVP RESPONSE',
+                   'valicert-license' => 'VALICERT LICENSE',
+                   'p7'               => 'PKCS#7',
+                   'p10'              => 'CERTIFICATE REQUEST',
+                  );
+
+sub asn_auto_type
+   #---------------------------------------------------------------------------#
+   # usage: $type = &asn_auto_type ($asn, \$buf, $symbols);                    #
+   #                                                                           #
+   # input: $asn     as returned from &asn_parse                               #
+   #        $buf     as input to &asn_parse                                    #
+   #        $symbols (HASHREF) symbol table returned from &asn_match.          #
+   #                                                                           #
+   # Tries to match $asn against known types, returning the type and filling   #
+   # in $symbols if a match is found.  Otherwise, returns undef and $symbols   #
+   # is empty.                                                                 #
+   #---------------------------------------------------------------------------#
+{
+   my $asn     = shift @_;
+   my $pbuf    = shift @_;
+   my $symbols = shift @_;
+
+   for $type (keys %asn_auto_types) {
+      if (&asn_match ($asn, $pbuf, $type, $symbols)) {
+         return $type;
+      }
+      &asn_clear_names ($asn);
+      %$symbols = ();
+   }
+}
+ 
+sub asn_chase_names
+   #---------------------------------------------------------------------------#
+   # usage: $pa = &asn_chase_names ($pa, $hash, $names, $pbuf);                #
+   #                                                                           #
+   # inputs: $pa     a reference to the current match pattern entry            #
+   #         $hash   the parsed symbol table so far                            #
+   #         $names  the current name scope in $hash                           #
+   #         $pbuf   pointer to the current ASN buffer                         #
+   #                                                                           #
+   # As long as the type {t} of $pa is a string, replaces $pa with the table   #
+   # reference corresponding to that name in the global pattern table in       #
+   # %asn_pats.  If the type name begins with '.', this is a special case      #
+   # designed to handle ANY DEFINED BY: the string after the '.' is the name   #
+   # of an existing entry in $hash pointing to an OID in $pbuf.  The "raw"     #
+   # form of the OID is meant to be used as the index into %asn_pats.          #
+   #---------------------------------------------------------------------------#
+{
+   my $pa    = shift @_;
+   my $hash  = shift @_;
+   my $names = shift @_;
+   my $pbuf  = shift @_;
+
+   #---------------------------------------------#
+   # Setup $t as the pattern type.  If it is     #
+   # a string naming a well-known pattern, chase #
+   # the real pattern out of $asn_pats.  If the  #
+   # string starts with ".", this is an ANY      #
+   # DEFINED BY thing, and the name after the .  #
+   # is an existing entry in $hash pointing to   #
+   # the OID that contains the type name.        #
+   #---------------------------------------------#
+   while (ref $pa eq 'HASH') {
+      my $t;
+      $t = $pa->{t};
+      if ($t =~ /^\./) {
+         my $reft = $names . substr ($t, 1);
+         my $ha = $hash->{$reft};
+         if ($ha) {
+            $t = &asn_format_prim ($ha, $pbuf, 1);  # get a raw OID
+         } else {
+            return undef;
+         }
+      }
+      last unless $asn_pats{$t};
+      $pa = $asn_pats{$t}->[0];
+   }
+   return $pa;
+}
+
+sub asn_match_tc
+   #---------------------------------------------------------------------------#
+   # usage: ($match, $name, $fmt, $opt) =                                      #
+   #           &asn_match_tc ($pa, $t, $cl, $hash, $names, $pbuf);             #
+   #                                                                           #
+   # input:  $pa     a reference to the current match pattern entry            #
+   #         $t      the current parsed type to be matched                     #
+   #         $cl     the current parsed class to be matched                    #
+   #         $hash   the parsed symbol table so far                            #
+   #         $names  the current name scope in $hash                           #
+   #         $pbuf   pointer to the current ASN buffer                         #
+   #                                                                           #
+   # output: $match  a reference to the match pattern entry matching $t & $cl  #
+   #         $name   the highest-level name that goes with $match              #
+   #         $fmt    the highest-level formatter that goes with $match         #
+   #         $opt    1 an optional match was found (and $match is undef)       #
+   #---------------------------------------------------------------------------#
+{
+   my $pa    = shift @_;
+   my $t     = shift @_;
+   my $cl    = shift @_;
+   my $hash  = shift @_;
+   my $names = shift @_;
+   my $pbuf  = shift @_;
+
+   if ($t == 0 and $cl == 0) {
+      # EOC #
+      return (undef, undef, undef, 2);
+   } elsif (ref $pa eq 'ARRAY') {
+      for $paa (@$pa) {
+         my ($ma, $name, $fmt, $opt) =
+            &asn_match_tc ($paa, $t, $cl, $hash, $names, $pbuf);
+         return ($ma, $name, $fmt, $opt) if $ma or $opt;
+      }
+   } else {
+      my $paname = $pa->{name};
+      my $pafmt  = $pa->{fmt};
+      $pa = &asn_chase_names ($pa, $hash, $names, $pbuf);
+      if (!$pa) {
+         return undef;
+      } elsif (ref $pa eq 'ARRAY') {
+         my ($ma, $name, $fmt, $opt) =
+            &asn_match_tc ($pa, $t, $cl, $hash, $names, $pbuf);
+         return ($ma, $paname || $name, $pafmt || $fmt, $opt);
+      } elsif (($pa->{t} == 0 and !$pa->{cl}) or
+               ($pa->{t} == $t and $pa->{cl} == $cl)) {
+         return ($pa, $paname || $pa->{name}, $pafmt || $pa->{fmt}, undef);
+      } elsif ($pa->{opt}) {
+         return (undef, undef, undef, 1);
+      }
+   }
+   return undef;
+}
+
+sub asn_match
+   # Matches $asn against $pat, adding entries to $hash (a HASHREF) that can   #
+   # be used to index names to specific $ha entries in the tree.  $names and   #
+   # $nums provide context for the key names (and the index names).            #
+{
+   my $asn   = shift @_; # ARRAYREF of HASHREF
+   my $pbuf  = shift @_; # REF to string
+   my $pat   = shift @_; # ARRAYREF of HASHREF
+   my $hash  = shift @_; # HASHREF
+   my $of    = shift @_; # boolean (false for SEQ/SET, true for SEQ/SET OF
+   my $names = shift @_; # string
+   my $nums  = shift @_; # string
+
+   $pat = $asn_pats{$pat} || $pat;
+
+   my ($i, $p);
+   for ($i=$p=0; $p <= $#$pat and $i <= $#$asn; $p += ($of ? 0 : 1)) {
+      #-----------------------------------------------------------------#
+      # Iterate over patterns in @$pat (indexed by $p, pointer in $pa)  #
+      # matching against parsed asn1 in @$asn (indexed by $i, pointer   #
+      # in $ha).  If the $of flag is set, we reuse $pat->[0], basically #
+      # pretending the supply is inexhaustible.                         #
+      #-----------------------------------------------------------------#
+      my $pa     = $pat->[$p];
+      my $ha     = $asn->[$i];
+
+      my $match;
+      my $mname;
+      my $mfmt;
+      my $opt;
+      
+      ($match, $mname, $mfmt, $opt) =
+         &asn_match_tc ($pa, $ha->{tag}, $ha->{class}, $hash, $names, $pbuf);
+
+      if ($match) {
+         my $num   = "$nums$i";
+         my $name  = "$names" . ($mname =~ /^#/ ? $i : $mname);
+
+         if ($mname) {
+            $hash->{$name} = $ha;
+            $ha->{name} = $name;
+            $name .= '.';
+         }
+         $hash->{$num}  = $ha;
+         $ha->{num}  = $num;
+         $num .= '.';
+         $ha->{fmt} = $mfmt if $mfmt;
+
+         if ($match->{cons}) {
+            #---------------------------------------------#
+            # The type is constructed: match the subarray #
+            # in $ha->{a} against the subtype, paying     #
+            # attention to the {of} flag.                 #
+            #---------------------------------------------#
+            return undef
+               unless $ha->{a}
+                  and &asn_match ($ha->{a},
+                                  $pbuf,
+                                  $match->{cons},
+                                  $hash,
+                                  $match->{of},
+                                  $name,
+                                  $num);
+            if ($mname =~ /#\.(.+)/) {
+               #-------------------------------------------------#
+               # name is "#.field", which means use # ($i) on    #
+               # the first pass, then look for "field" in the    #
+               # substructure.  If it is there, rename the top   #
+               # node to the value of the "field".  For example, #
+               # a cert extension is named "...0" initially, and #
+               # its fields are named "...0.id", "...0.value".   #
+               # Afterwards, "...0" is renamed "...name" where   #
+               # "name" is what format_prim returns for the id.  #
+               #-------------------------------------------------#
+               my $sub = $hash->{"$names$i.$1"};
+               if ($sub) {
+                  $sub = &asn_format_prim ($sub, $pbuf, 2); # no (oid)
+                  $hash->{"\L$names$sub"} = $hash->{"$names$i"};
+                  $ha->{name} = "$names$sub";
+               }
+            }
+         }
+
+         $i++;
+      } elsif ($opt == 2) {
+         $i++;
+      } elsif (!$opt) {
+         return undef;
+      }
+   }
+   if ($i == $#$asn and $asn->[$i]->{tag} == 0
+                    and $asn->[$i]->{class} == 0) {
+      $i++;
+   }
+   return $i == 1+$#$asn and ($of or $p == 1+$#$pat);
+}
+
+sub asn_lookup
+   #---------------------------------------------------------------------------#
+   # usage: ($off, $len) = &asn_lookup ($field, $symbols);                     #
+   #                                                                           #
+   # input: $field   the name of the field to be matched in $symbols           #
+   #        $symbols a HASHREF symbol table pointing to ASN parse nodes        #
+   #                                                                           #
+   # Tries to match $field against $symbols four ways, returning the offset    #
+   # length of the selected field from the parse tree.  The "value" flag       #
+   # indicates that a matched field name was followed with a ".value" suffix,  #
+   # which in turn means that only the ASN.1 contents octets are indicated     #
+   # instead of the entire node (including the tag and length octets).  The    #
+   # four match attempts are as follows:                                       #
+   #   1) exact match of $field                                                #
+   #   2) exact match of $field after stripping the .value suffix (if present) #
+   #   3) suffix match of $field (i.e. *.field matched exactly and uniquely)   #
+   #   4) suffix match of $field after stripping the .value suffix             #
+   # On error (all attempts failed or a partial match was ambiguous), the      #
+   # function returns an offset of -1 and an error string in $len (sorry about #
+   # that -- ain't polymorphism grand).                                        #
+   #---------------------------------------------------------------------------#
+{
+   my $field   = lc (shift @_);
+   my $symbols = shift @_;
+
+   my ($value, $ha, @match);
+
+   $value = $1 if $field =~ /^(.*)\.value$/;
+   if ($ha = $symbols->{$field}) {
+      # ok
+   } elsif ($value and $ha = $symbols->{$value}) {
+      # ok
+   } elsif (@match = grep (/\.$field$/, keys %$symbols)) {
+      return (-1, "error: $field ambiguous:\n   ".
+                          join ("\n   ", @match))
+         if $#match > 0;
+      $ha = $symbols->{$match[0]};
+   } elsif ($value and @match = grep (/\.$value$/, keys %$symbols)) {
+      return (-1, "error: $value ambiguous:\n   ".
+                          join ("\n   ", @match))
+         if $#match > 0;
+      $ha = $symbols->{$match[0]};
+   } else {
+      return (-1, "error: $field not found.");
+   }
+   return ($ha->{off} - ($value ? 0 : $ha->{hlen}),
+           $ha->{len} + ($value ? 0 : $ha->{hlen}));
+}
+
+#==============================================================================#
+#                                  f i l e s                                   #
+#==============================================================================#
+
+sub isnum
+   #---------------------------------------------------------------------------#
+   # usage: if (&isnum (str, ...)) ...                                         #
+   #                                                                           #
+   # Returns 1 if all arguments look like a number in one of the following     #
+   # formats:                                                                  #
+   #   decimal   normal       952                                              #
+   #   octal     leading 0    0277                                             #
+   #   hex       leading 0x   0x1F                                             #
+   #   binary    leaning 0b   0b1101                                           #
+   # Otherwise, returns undef.                                                 #
+   #---------------------------------------------------------------------------#
+{
+   while (@_) {
+      my $arg = shift @_;
+      if ($arg eq '' or
+          $arg =~ /[1-9][0-9]*/ or
+          $arg =~ /0x[0-9a-fA-F]+/ or
+          $arg =~ /0b[0-1]+/ or
+          $arg =~ /0[0-7]*/) {
+         next;
+      }
+      return undef;
+   }
+   return 1;
+}
+
+sub parse_filename
+   #---------------------------------------------------------------------------#
+   # usage: $hashref = &parse_filename ('name[opts]', \%FORMS);                #
+   #                                                                           #
+   # Parses a filespec consisting of a filename followed by optional options   #
+   # enclosed in square brackets and separated by commas:                      #
+   #   filename [ '[' option { ',' option } ']' ]                              #
+   #                                                                           #
+   # Options must either be a FORM, identified by a key in %FORMS, or an       #
+   # offset:length specification.  In offset:length, both the offset and the   #
+   # length are optional.  Additionally, if there is no length, the : is       #
+   # optional:                                                                 #
+   #   [offset] [':' [length]]                                                 #
+   #                                                                           #
+   # Both offset and length take the form of a number (see &isnum above).      #
+   #                                                                           #
+   # Returns a hashref containing the following keys:                          #
+   #   name    => filename                                                     #
+   #   form    => the file format (from %FORMS)                                #
+   #   off     => offset                                                       #
+   #   len     => length                                                       #
+   #   asn     => asn[:type][.field][,[off]:[len]] found                       #
+   #   asn.xxx => pieces of asn syntax found as above                          #
+   # In case of error, the function pushes a message onto an array member:     #
+   #   error   => array of error messages ('defined' only in case of error)    #
+   #---------------------------------------------------------------------------#
+{
+   my $arg   = shift @_;
+   my $forms = shift @_;
+   my $rc    = {};
+   my $fn    = $arg;
+   my $fm;
+   my $off;
+   my $len;
+
+   if ($arg =~ /^([^#].*)\[(.*)\]$/) {
+      #---------------------------------------------#
+      # Found name[options]: name is $1, options $2 #
+      #---------------------------------------------#
+      $rc->{name} = $1;
+      for $spec (split (/[ ,\/]/, $2)) {
+         if ($spec =~ /^([a-zA-Z]\w*)(:[^\.]+)?(\..*)?/) {
+            #----------------------------------------#
+            # Looks like form:type.field ($1:$2.$3), #
+            # type and field optional.               #
+            #----------------------------------------#
+            if (!$forms->{$1}) {
+               push @{$rc->{error}}, "error: unrecognized form \"$1\": ".
+                                             join (',', sort keys %$forms).
+                                             " expected.";
+               return $rc;
+            }
+            $rc->{form} = $1 if $forms->{$1} == 1;   # FORM type 1 is a "form"
+            $rc->{$1}   = 1  if $forms->{$1} == 2;   # FORM type 2 is a "flag"
+            $rc->{"$1.type"} = substr ($2, 1);       # set type ...
+            $rc->{"$1.field"} = substr ($3, 1);      # ... and field always
+         } else {
+            #--------------------------------------#
+            # Must be offset:length, both optional #
+            #--------------------------------------#
+            my @ol = split (':', $spec, 2);
+            if (&isnum (@ol)) {
+               if ($rc->{asn}) {
+                  #----------------------------------------#
+                  # Special case if off:len are seen after #
+                  # the asn flag: it means substring the   #
+                  # selected field, so we set asn.off and  #
+                  # asn.len instead.                       #
+                  # (I know this is cheating -- I'll       #
+                  # figure something clean out later)      #
+                  #----------------------------------------#
+                  if ($ol[0]) {
+                     $rc->{'asn.off'} = $ol[0];
+                     $rc->{'asn.off'} = oct ($rc->{'asn.off'})
+                        if $rc->{'asn.off'} =~ /^0/;
+                  }
+                  if ($ol[1]) {
+                     $rc->{'asn.len'} = $ol[1];
+                     $rc->{'asn.len'} = oct ($rc->{'asn.len'})
+                        if $rc->{'asn.len'} =~ /^0/;
+                  }
+               } else {
+                  #----------------#
+                  # Normal off:len #
+                  #----------------#
+                  if ($ol[0]) {
+                     $rc->{off} = $ol[0];
+                     $rc->{off} = oct ($rc->{off}) if $rc->{off} =~ /^0/;
+                  }
+                  if ($ol[1]) {
+                     $rc->{len} = $ol[1];
+                     $rc->{len} = oct ($rc->{len}) if $rc->{len} =~ /^0/;
+                  }
+               }
+            } else {
+               push @{$rc->{error}}, "error: offset:length and/or ",
+                                             join (',', sort keys %$forms),
+                                             " expected: [$spec].";
+               return $rc;
+            }
+         }
+      }
+   } else {
+      #------------------------#
+      # Otherwise, just a name #
+      #------------------------#
+      $rc->{name} = $fn;
+   }
+   return $rc;
+}
+
+#==============================================================================#
+#                                   o i d s                                    #
+#==============================================================================#
+
+%OID = (
+   '0.9.2342.19200300.100.1.25'  => 'domainComponent',
+   '1.2.36.75878867.1.100.1.1'   => 'Certificates Australia policyIdentifier',
+   '1.2.36.68980861.1.1.2'       => 'Signet personal',
+   '1.2.36.68980861.1.1.3'       => 'Signet business',
+   '1.2.36.68980861.1.1.4'       => 'Signet legal',
+   '1.2.36.68980861.1.1.10'      => 'Signet pilot',
+   '1.2.36.68980861.1.1.11'      => 'Signet intraNet',
+   '1.2.36.68980861.1.1.20'      => 'Signet securityPolicy',
+   '1.2.752.34.1'                => 'seis-cp',
+   '1.2.752.34.1.1'              => 'SEIS certificatePolicy-s10',
+   '1.2.752.34.2'                => 'SEIS pe',
+   '1.2.752.34.3'                => 'SEIS at',
+   '1.2.752.34.3.1'              => 'SEIS at-personalIdentifier',
+   '1.2.840.10040.2.1'           => 'holdinstruction-none',
+   '1.2.840.10040.2.2'           => 'holdinstruction-callissuer',
+   '1.2.840.10040.2.3'           => 'holdinstruction-reject',
+   '1.2.840.10040.4.1'           => 'dsa',
+   '1.2.840.10040.4.3'           => 'dsaWithSha1',
+   '1.2.840.10045.1'             => 'fieldType',
+   '1.2.840.10045.1.1'           => 'prime-field',
+   '1.2.840.10045.1.2'           => 'characteristic-two-field',
+   '1.2.840.10045.1.2.3'         => 'characteristic-two-basis',
+   '1.2.840.10045.1.2.3.1'       => 'onBasis',
+   '1.2.840.10045.1.2.3.2'       => 'tpBasis',
+   '1.2.840.10045.1.2.3.3'       => 'ppBasis',
+   '1.2.840.10045.1.2'           => 'public-key-type',
+   '1.2.840.10045.1.2.1'         => 'ecPublicKey',
+   '1.2.840.10045.2'             => 'publicKeyType',
+   '1.2.840.10045.2.1'           => 'ecPublicKey',
+   '1.2.840.10046.2.1'           => 'dhPublicNumber',
+   '1.2.840.113533.7'            => 'nsn',
+   '1.2.840.113533.7.65'         => 'nsn-ce',
+   '1.2.840.113533.7.65.0'       => 'entrustVersInfo',
+   '1.2.840.113533.7.66'         => 'nsn-alg',
+   '1.2.840.113533.7.66.3'       => 'cast3CBC',
+   '1.2.840.113533.7.66.10'      => 'cast5CBC',
+   '1.2.840.113533.7.66.11'      => 'cast5MAC',
+   '1.2.840.113533.7.66.12'      => 'pbeWithMD5AndCAST5-CBC',
+   '1.2.840.113533.7.66.13'      => 'passwordBasedMac',
+   '1.2.840.113533.7.67'         => 'nsn-oc',
+   '1.2.840.113533.7.67.0'       => 'entrustUser',
+   '1.2.840.113533.7.68'         => 'nsn-at',
+   '1.2.840.113533.7.68.0'       => 'entrustCAInfo',
+   '1.2.840.113533.7.68.10'      => 'attributeCertificate',
+   '1.2.840.113549.1.1'          => 'pkcs-1',
+   '1.2.840.113549.1.1.1'        => 'rsaEncryption',
+   '1.2.840.113549.1.1.2'        => 'md2WithRSAEncryption',
+   '1.2.840.113549.1.1.3'        => 'md4WithRSAEncryption',
+   '1.2.840.113549.1.1.4'        => 'md5WithRSAEncryption',
+   '1.2.840.113549.1.1.5'        => 'sha1WithRSAEncryption',
+   '1.2.840.113549.1.1.6'        => 'rsaOAEPEncryptionSET',
+   '1.2.840.113549.1.1.11'       => 'sha256WithRSAEncryption',
+   '1.2.840.113549.1.1.12'       => 'sha384WithRSAEncryption',
+   '1.2.840.113549.1.1.13'       => 'sha512WithRSAEncryption',
+   '1.2.840.113549.1.3'          => 'pkcs-3',
+   '1.2.840.113549.1.3.1'        => 'dhKeyAgreement',
+   '1.2.840.113549.1.5'          => 'pkcs-5',
+   '1.2.840.113549.1.5.1'        => 'pbeWithMD2AndDES-CBC',
+   '1.2.840.113549.1.5.3'        => 'pbeWithMD5AndDES-CBC',
+   '1.2.840.113549.1.5.4'        => 'pbeWithMD2AndRC2-CBC',
+   '1.2.840.113549.1.5.6'        => 'pbeWithMD5AndRC2-CBC',
+   '1.2.840.113549.1.5.9'        => 'pbeWithMD5AndXOR',
+   '1.2.840.113549.1.5.10'       => 'pbeWithSHAAndDES-CBC',
+   '1.2.840.113549.1.7'          => 'pkcs-7',
+   '1.2.840.113549.1.7.1'        => 'data',
+   '1.2.840.113549.1.7.2'        => 'signedData',
+   '1.2.840.113549.1.7.3'        => 'envelopedData',
+   '1.2.840.113549.1.7.4'        => 'signedAndEnvelopedData',
+   '1.2.840.113549.1.7.5'        => 'digestData',
+   '1.2.840.113549.1.7.6'        => 'encryptedData',
+   '1.2.840.113549.1.7.7'        => 'dataWithAttributes',
+   '1.2.840.113549.1.7.8'        => 'encryptedPrivateKeyInfo',
+   '1.2.840.113549.1.9'          => 'pkcs-9',
+   '1.2.840.113549.1.9.1'        => 'e',
+   '1.2.840.113549.1.9.2'        => 'unstructuredName',
+   '1.2.840.113549.1.9.3'        => 'contentType',
+   '1.2.840.113549.1.9.4'        => 'messageDigest',
+   '1.2.840.113549.1.9.5'        => 'signingTime',
+   '1.2.840.113549.1.9.6'        => 'countersignature',
+   '1.2.840.113549.1.9.7'        => 'challengePassword',
+   '1.2.840.113549.1.9.8'        => 'unstructuredAddress',
+   '1.2.840.113549.1.9.9'        => 'extendedCertificateAttributes',
+   '1.2.840.113549.1.9.10'       => 'issuerAndSerialNumber',
+   '1.2.840.113549.1.9.11'       => 'passwordCheck',
+   '1.2.840.113549.1.9.12'       => 'publicKey',
+   '1.2.840.113549.1.9.13'       => 'signingDescription',
+   '1.2.840.113549.1.9.14'       => 'extensionReq',
+   '1.2.840.113549.1.9.15'       => 'sMIMECapabilities',
+   '1.2.840.113549.1.9.15.1'     => 'preferSignedData',
+   '1.2.840.113549.1.9.15.2'     => 'canNotDecryptAny',
+   '1.2.840.113549.1.9.15.3'     => 'receiptRequest',
+   '1.2.840.113549.1.9.15.4'     => 'receipt',
+   '1.2.840.113549.1.9.15.5'     => 'contentHints',
+   '1.2.840.113549.1.9.15.6'     => 'mlExpansionHistory',
+   '1.2.840.113549.1.9.16'       => 'id-sMIME',
+   '1.2.840.113549.1.9.16.0'     => 'id-mod',
+   '1.2.840.113549.1.9.16.0.1'   => 'id-mod-cms',
+   '1.2.840.113549.1.9.16.0.2'   => 'id-mod-ess',
+   '1.2.840.113549.1.9.16.0.4'   => 'id-mod-smime',
+   '1.2.840.113549.1.9.16.1'     => 'id-ct',
+   '1.2.840.113549.1.9.16.1.1'   => 'id-ct-receipt',
+   '1.2.840.113549.1.9.16.1.2'   => 'id-ct-authData',
+   '1.2.840.113549.1.9.16.2'     => 'id-aa',
+   '1.2.840.113549.1.9.16.2.1'   => 'id-aa-receiptRequest',
+   '1.2.840.113549.1.9.16.2.2'   => 'id-aa-securityLabel',
+   '1.2.840.113549.1.9.16.2.3'   => 'id-aa-mlExpandHistory',
+   '1.2.840.113549.1.9.16.2.4'   => 'id-aa-contentHint',
+   '1.2.840.113549.1.9.16.2.13'  => 'id-aa-smimeEncryptCerts',
+   '1.2.840.113549.1.9.20'       => 'friendlyName',
+   '1.2.840.113549.1.9.21'       => 'localKeyID',
+   '1.2.840.113549.1.9.22'       => 'certTypes',
+   '1.2.840.113549.1.9.22.1'     => 'x509Certificate',
+   '1.2.840.113549.1.9.22.2'     => 'sdsiCertificate',
+   '1.2.840.113549.1.9.23'       => 'crlTypes',
+   '1.2.840.113549.1.9.23.1'     => 'x509Crl',
+   '1.2.840.113549.1.12'         => 'pkcs-12',
+   '1.2.840.113549.1.12.1'       => 'pkcs-12-PbeIds',
+   '1.2.840.113549.1.12.1.1'     => 'pbeWithSHAAnd128BitRC4',
+   '1.2.840.113549.1.12.1.2'     => 'pbeWithSHAAnd40BitRC4',
+   '1.2.840.113549.1.12.1.3'     => 'pbeWithSHAAnd3-KeyTripleDES-CBC',
+   '1.2.840.113549.1.12.1.4'     => 'pbeWithSHAAnd2-KeyTripleDES-CBC',
+   '1.2.840.113549.1.12.1.5'     => 'pbeWithSHAAnd128BitRC2-CBC',
+   '1.2.840.113549.1.12.1.6'     => 'pbeWithSHAAnd40BitRC2-CBC',
+   '1.2.840.113549.1.12.2'       => 'pkcs-12-ESPVKID',
+   '1.2.840.113549.1.12.2.1'     => 'pkcs-12-PKCS8KeyShrouding',
+   '1.2.840.113549.1.12.3'       => 'pkcs-12-BagIds',
+   '1.2.840.113549.1.12.3.1'     => 'pkcs-12-keyBagId',
+   '1.2.840.113549.1.12.3.2'     => 'pkcs-12-certAndCRLBagId',
+   '1.2.840.113549.1.12.3.3'     => 'pkcs-12-secretBagId',
+   '1.2.840.113549.1.12.3.4'     => 'pkcs-12-safeContentsId',
+   '1.2.840.113549.1.12.3.5'     => 'pkcs-12-pkcs-8ShroudedKeyBagId',
+   '1.2.840.113549.1.12.4'       => 'pkcs-12-CertBagID',
+   '1.2.840.113549.1.12.4.1'     => 'pkcs-12-X509CertCRLBagID',
+   '1.2.840.113549.1.12.4.2'     => 'pkcs-12-SDSICertBagID',
+   '1.2.840.113549.1.12.5'       => 'pkcs-12-OID',
+   '1.2.840.113549.1.12.5.1'     => 'pkcs-12-PBEID',
+   '1.2.840.113549.1.12.5.1.1'   => 'pkcs-12-PBEWithSha1And128BitRC4',
+   '1.2.840.113549.1.12.5.1.2'   => 'pkcs-12-PBEWithSha1And40BitRC4',
+   '1.2.840.113549.1.12.5.1.3'   => 'pkcs-12-PBEWithSha1AndTripleDESCBC',
+   '1.2.840.113549.1.12.5.1.4'   => 'pkcs-12-PBEWithSha1And128BitRC2CBC',
+   '1.2.840.113549.1.12.5.1.5'   => 'pkcs-12-PBEWithSha1And40BitRC2CBC',
+   '1.2.840.113549.1.12.5.1.6'   => 'pkcs-12-PBEWithSha1AndRC4',
+   '1.2.840.113549.1.12.5.1.7'   => 'pkcs-12-PBEWithSha1AndRC2CBC',
+   '1.2.840.113549.1.12.5.2'     => 'pkcs-12-EnvelopingID',
+   '1.2.840.113549.1.12.5.2.1'   => 'pkcs-12-RSAEncryptionWith128BitRC4',
+   '1.2.840.113549.1.12.5.2.2'   => 'pkcs-12-RSAEncryptionWith40BitRC4',
+   '1.2.840.113549.1.12.5.2.3'   => 'pkcs-12-RSAEncryptionWithTripleDES',
+   '1.2.840.113549.1.12.5.3'     => 'pkcs-12-SignatureID',
+   '1.2.840.113549.1.12.5.3.1'   => 'pkcs-12-RSASignatureWithSHA1Digest',
+   '1.2.840.113549.1.12.10'      => 'pkcs-12Version1',
+   '1.2.840.113549.1.12.10.1'    => 'pkcs-12BadIds',
+   '1.2.840.113549.1.12.10.1.1'  => 'pkcs-12-keyBag',
+   '1.2.840.113549.1.12.10.1.2'  => 'pkcs-12-pkcs-8ShroudedKeyBag',
+   '1.2.840.113549.1.12.10.1.3'  => 'pkcs-12-certBag',
+   '1.2.840.113549.1.12.10.1.4'  => 'pkcs-12-crlBag',
+   '1.2.840.113549.1.12.10.1.5'  => 'pkcs-12-secretBag',
+   '1.2.840.113549.1.12.10.1.6'  => 'pkcs-12-safeContentsBag',
+   '1.2.840.113549.2'            => 'digestAlgorithm',
+   '1.2.840.113549.2.2'          => 'md2',
+   '1.2.840.113549.2.4'          => 'md4',
+   '1.2.840.113549.2.5'          => 'md5',
+   '1.2.840.113549.3'            => 'encryptionAlgorithm',
+   '1.2.840.113549.3.2'          => 'rc2CBC',
+   '1.2.840.113549.3.3'          => 'rc2ECB',
+   '1.2.840.113549.3.4'          => 'rc4',
+   '1.2.840.113549.3.5'          => 'rc4WithMAC',
+   '1.2.840.113549.3.6'          => 'DESX-CBC',
+   '1.2.840.113549.3.7'          => 'DES-EDE3-CBC',
+   '1.2.840.113549.3.8'          => 'RC5CBC',
+   '1.2.840.113549.3.9'          => 'RC5-CBCPad',
+   '1.2.840.113549.3.10'         => 'desCDMF',
+   '1.2.840.113556'              => 'microsoft',
+   '1.2.840.113556.4.3'          => 'microsoftExcel',
+   '1.2.840.113556.4.4'          => 'titledWithOID',
+   '1.2.840.113556.4.5'          => 'microsoftPowerPoint',
+   '1.2.840.114021'              => 'identrus',
+   '1.2.840.114021.1'            => 'identrusPolicy',
+   '1.2.840.114021.1.1'          => 'identrusRootCaPolicy',
+   '1.2.840.114021.1.2'          => 'identrusOcspPolicy',
+   '1.2.840.114021.1.4'          => 'identrusIdentityPolicy',
+   '1.2.840.114021.1.5'          => 'identrusUtilityPolicy',
+   '1.2.840.114021.2'            => 'identrusPe',
+   '1.2.840.114021.2.1'          => 'identrusPePilot',
+   '1.2.840.114021.2.2'          => 'identrusPeTest',
+   '1.2.840.114021.2.3'          => 'identrusPeProduction',
+   '1.2.840.114021.3'            => 'identrusCID',
+   '1.2.840.114021.3.1'          => 'ABN-AMRO',
+   '1.2.840.114021.3.2'          => 'BofA',
+   '1.2.840.114021.3.3'          => 'Barclays',
+   '1.2.840.114021.3.4'          => 'Chase',
+   '1.2.840.114021.3.5'          => 'CIBC',
+   '1.2.840.114021.3.6'          => 'Citibank',
+   '1.2.840.114021.3.7'          => 'DeutscheBank',
+   '1.2.840.114021.3.8'          => 'HSBC',
+   '1.2.840.114021.3.9'          => 'HypoVereinsbank',
+   '1.2.840.114021.3.10'         => 'IBJ',
+   '1.2.840.114021.3.11'         => 'NatWest',
+   '1.2.840.114021.3.12'         => 'Sanwa',
+   '1.2.840.114021.4.1'          => 'identrus-csc-access-method',
+   '1.3.6.1.4.1.311.2.1.4'       => 'spcIndirectDataContext',
+   '1.3.6.1.4.1.311.2.1.10'      => 'spcAgencyInfo',
+   '1.3.6.1.4.1.311.2.1.11'      => 'spcStatementType',
+   '1.3.6.1.4.1.311.2.1.12'      => 'spcSpOpusInfo',
+   '1.3.6.1.4.1.311.2.1.14'      => 'certExtensions',
+   '1.3.6.1.4.1.311.2.1.15'      => 'spcPelmageData',
+   '1.3.6.1.4.1.311.2.1.20'      => 'spcLink',
+   '1.3.6.1.4.1.311.2.1.21'      => 'individualCodeSigning',
+   '1.3.6.1.4.1.311.2.1.22'      => 'commercialCodeSigning',
+   '1.3.6.1.4.1.311.2.1.25'      => 'spcLink',
+   '1.3.6.1.4.1.311.2.1.26'      => 'spcMinimalCriteriaInfo',
+   '1.3.6.1.4.1.311.2.1.27'      => 'spcFinancialCriteriaInfo',
+   '1.3.6.1.4.1.311.2.1.28'      => 'spcLink',
+   '1.3.6.1.4.1.311.10.1'        => 'certTrustList',
+   '1.3.6.1.4.1.311.10.2'        => 'nextUpdateLocation',
+   '1.3.6.1.4.1.311.10.3.1'      => 'certTrustListSigning',
+   '1.3.6.1.4.1.311.10.3.2'      => 'timeStampSigning',
+   '1.3.6.1.4.1.311.10.3.3'      => 'serverGatedCrypto',
+   '1.3.6.1.4.1.311.10.3.4'      => 'encryptedFileSystem',
+   '1.3.6.1.4.1.311.10.4.1'      => 'yesnoTrustAttr',
+   '1.3.6.1.4.1.311.16.4'        => 'microsoft-SMimeEncryptCert',
+   '1.3.6.1.4.1.2428.10.1.1'     => 'UNINETT policyIdentifier',
+   '1.3.6.1.4.1.2712.10'         => 'ICE-TEL policyIdentifier',
+   '1.3.6.1.4.1.2930'            => 'valicert',
+   '1.3.6.1.4.1.2930.6'          => 'valicert-scvp',
+   '1.3.6.1.4.1.2930.6.1'        => 'valicert-scvp-type',
+   '1.3.6.1.4.1.2930.6.1.0'      => 'valicert-scvp-type-path-build',
+   '1.3.6.1.4.1.2930.6.1.1'      => 'valicert-scvp-type-path-valid',
+   '1.3.6.1.4.1.2930.6.1.2'      => 'valicert-scvp-type-rev-status',
+   '1.3.6.1.4.1.2930.6.2'        => 'valicert-scvp-want',
+#  '1.3.6.1.4.1.2930.6.2.0'      => 'valicert-scvp-want-chain',
+#  '1.3.6.1.4.1.2930.6.2.1'      => 'valicert-scvp-want-proof',
+   '1.3.6.1.4.1.3029.32.1'       => 'cryptlibEnvelope',
+   '1.3.6.1.4.1.3029.32.2'       => 'cryptlibPrivateKey',
+   '1.3.6.1.5.5.7'               => 'pkix',
+   '1.3.6.1.5.5.7.1'             => 'privateExtension',
+   '1.3.6.1.5.5.7.1.1'           => 'authorityInfoAccess',
+   '1.3.6.1.5.5.7.2'             => 'policyQualifierIds',
+   '1.3.6.1.5.5.7.2.1'           => 'cps',
+   '1.3.6.1.5.5.7.2.2'           => 'unotice',
+   '1.3.6.1.5.5.7.3'             => 'keyPurpose',
+   '1.3.6.1.5.5.7.3.1'           => 'serverAuth',
+   '1.3.6.1.5.5.7.3.2'           => 'clientAuth',
+   '1.3.6.1.5.5.7.3.3'           => 'codeSigning',
+   '1.3.6.1.5.5.7.3.4'           => 'emailProtection',
+   '1.3.6.1.5.5.7.3.5'           => 'ipsecEndSystem',
+   '1.3.6.1.5.5.7.3.6'           => 'ipsecTunnel',
+   '1.3.6.1.5.5.7.3.7'           => 'ipsecUser',
+   '1.3.6.1.5.5.7.3.8'           => 'timeStamping',
+   '1.3.6.1.5.5.7.3.9'           => 'ocspSigning',
+   '1.3.6.1.5.5.7.4'             => 'cmpInformationTypes',
+   '1.3.6.1.5.5.7.4.1'           => 'caProtEncCert',
+   '1.3.6.1.5.5.7.4.2'           => 'signKeyPairTypes',
+   '1.3.6.1.5.5.7.4.3'           => 'encKeyPairTypes',
+   '1.3.6.1.5.5.7.4.4'           => 'preferredSymmAlg',
+   '1.3.6.1.5.5.7.4.5'           => 'caKeyUpdateInfo',
+   '1.3.6.1.5.5.7.4.6'           => 'currentCRL',
+   '1.3.6.1.5.5.7.48.1'          => 'ocsp',
+   '1.3.6.1.5.5.7.48.1.1'        => 'ocsp-basic',
+   '1.3.6.1.5.5.7.48.1.2'        => 'ocsp-nonce',
+   '1.3.6.1.5.5.7.48.1.3'        => 'ocsp-crl',
+   '1.3.6.1.5.5.7.48.1.4'        => 'ocsp-response',
+   '1.3.6.1.5.5.7.48.1.5'        => 'ocsp-nocheck',
+   '1.3.6.1.5.5.7.48.1.6'        => 'archive-cutoff',
+   '1.3.6.1.5.5.7.48.1.7'        => 'service-locator',
+   '1.3.6.1.5.5.7.48.2'          => 'caIssuers',
+   '1.3.6.1.5.5.8.1.1'           => 'HMAC-MD5',
+   '1.3.6.1.5.5.8.1.2'           => 'HMAC-SHA',
+   '1.3.14.2.26.5'               => 'sha',
+   '1.3.14.3.2.1.1'              => 'rsa',
+   '1.3.14.3.2.2'                => 'md4WitRSA',
+   '1.3.14.3.2.3'                => 'md5WithRSA',
+   '1.3.14.3.2.4'                => 'md4WithRSAEncryption',
+   '1.3.14.3.2.2.1'              => 'sqmod-N',
+   '1.3.14.3.2.3.1'              => 'sqmod-NwithRSA',
+   '1.3.14.3.2.6'                => 'desECB',
+   '1.3.14.3.2.7'                => 'desCBC',
+   '1.3.14.3.2.8'                => 'desOFB',
+   '1.3.14.3.2.9'                => 'desCFB',
+   '1.3.14.3.2.10'               => 'desMAC',
+   '1.3.14.3.2.11'               => 'rsaSignature',
+   '1.3.14.3.2.12'               => 'dsa',
+   '1.3.14.3.2.13'               => 'dsaWithSHA',
+   '1.3.14.3.2.14'               => 'mdc2WithRSASignature',
+   '1.3.14.3.2.15'               => 'shaWithRSASignature',
+   '1.3.14.3.2.16'               => 'dhWithCommonModulus',
+   '1.3.14.3.2.17'               => 'desEDE',
+   '1.3.14.3.2.18'               => 'sha',
+   '1.3.14.3.2.19'               => 'mdc-2',
+   '1.3.14.3.2.20'               => 'dsaCommon',
+   '1.3.14.3.2.21'               => 'dsaCommonWithSHA',
+   '1.3.14.3.2.22'               => 'rsaKeyTransport',
+   '1.3.14.3.2.23'               => 'keyed-hash-seal',
+   '1.3.14.3.2.24'               => 'md2WithRSASignature',
+   '1.3.14.3.2.25'               => 'md5WithRSASignature',
+   '1.3.14.3.2.26'               => 'sha1',
+   '1.3.14.3.2.27'               => 'dsaWithSHA1',
+   '1.3.14.3.2.28'               => 'dsaWithCommonSHA1',
+   '1.3.14.3.2.29'               => 'sha-1WithRSAEncryption',
+   '1.3.14.3.3.1'                => 'simple-strong-auth-mechanism',
+   '1.3.14.7.2.1.1'              => 'ElGamal',
+   '1.3.14.7.2.3.1'              => 'md2WithRSA',
+   '1.3.14.7.2.3.2'              => 'md2WithElGamal',
+   '1.3.36.3'                    => 'algorithm',
+   '1.3.36.3.1'                  => 'encryptionAlgorithm',
+   '1.3.36.3.1.1'                => 'des',
+   '1.3.36.3.1.1.1.1'            => 'desECBPad',
+   '1.3.36.3.1.1.2.1'            => 'desCBCPad',
+   '1.3.36.3.1.1.1.1.1'          => 'desECBPadISO',
+   '1.3.36.3.1.1.2.1.1'          => 'desCBCPadISO',
+   '1.3.36.3.1.3'                => 'des-3',
+   '1.3.36.3.1.3'                => 'des-3',
+   '1.3.36.3.1.3.1.1'            => 'des-3ECBPad',
+   '1.3.36.3.1.3.2.1'            => 'des-3CBCPad',
+   '1.3.36.3.1.3.1.1.1'          => 'des-3ECBPadISO',
+   '1.3.36.3.1.3.2.1.1'          => 'des-3CBCPadISO',
+   '1.3.36.3.1.2'                => 'idea',
+   '1.3.36.3.1.2.1'              => 'ideaECB',
+   '1.3.36.3.1.2.2'              => 'ideaCBC',
+   '1.3.36.3.1.2.3'              => 'ideaOFB',
+   '1.3.36.3.1.2.4'              => 'ideaCFB',
+   '1.3.36.3.1.2.1.1'            => 'ideaECBPad',
+   '1.3.36.3.1.2.2.1'            => 'ideaCBCPad',
+   '1.3.36.3.1.2.1.1.1'          => 'ideaECBPadISO',
+   '1.3.36.3.1.2.2.1.1'          => 'ideaCBCPadISO',
+   '1.3.36.3.2'                  => 'hashAlgorithm',
+   '1.3.36.3.2.1'                => 'ripemd160',
+   '1.3.36.3.2.2'                => 'ripemd128',
+   '1.3.36.3.2.3'                => 'ripemd256',
+   '1.3.36.3.2.4'                => 'mdc2singleLength',
+   '1.3.36.3.2.5'                => 'mdc2doubleLength',
+   '1.3.36.3.3'                  => 'signatureAlgorithm',
+   '1.3.36.3.3.1'                => 'rsa',
+   '1.3.36.3.3.1.1'              => 'rsaMitSHA-1',
+   '1.3.36.3.3.1.2'              => 'rsaMitRIPEMD160',
+   '1.3.36.3.3.2'                => 'ellipticCurve',
+   '1.3.36.3.4'                  => 'signatureScheme',
+   '1.3.36.3.4.1'                => 'iso9796-1',
+   '1.3.36.3.4.2.1'              => 'iso9796-2',
+   '1.3.36.3.4.2.2'              => 'iso9796-2rsa',
+   '1.3.36.4'                    => 'attribute',
+   '1.3.36.5'                    => 'policy',
+   '1.3.36.6'                    => 'api',
+   '1.3.36.6.1'                  => 'manufacturerSpecific',
+   '1.3.36.6.2'                  => 'functionalitySpecific',
+   '1.3.36.7'                    => 'api',
+   '1.3.36.7.1'                  => 'keyAgreement',
+   '1.3.36.7.2'                  => 'keyTransport',
+   '2.5.4.0'                     => 'objectClass',
+   '2.5.4.1'                     => 'aliasObjectName',
+   '2.5.4.2'                     => 'knowledgeInformation',
+   '2.5.4.3'                     => 'cn',
+   '2.5.4.4'                     => 's',
+   '2.5.4.5'                     => 'serial',
+   '2.5.4.6'                     => 'c',
+   '2.5.4.7'                     => 'locality',
+   '2.5.4.8'                     => 'stateOrProvince',
+   '2.5.4.9'                     => 'street',
+   '2.5.4.10'                    => 'o',
+   '2.5.4.11'                    => 'ou',
+   '2.5.4.12'                    => 'title',
+   '2.5.4.13'                    => 'description',
+   '2.5.4.14'                    => 'searchGuide',
+   '2.5.4.15'                    => 'businessCategory',
+   '2.5.4.16'                    => 'postalAddress',
+   '2.5.4.17'                    => 'postalCode',
+   '2.5.4.18'                    => 'postOfficeBox',
+   '2.5.4.19'                    => 'physicalDeliveryOfficeName',
+   '2.5.4.20'                    => 'telephoneNumber',
+   '2.5.4.21'                    => 'telexNumber',
+   '2.5.4.22'                    => 'teletexTerminalIdentifier',
+   '2.5.4.23'                    => 'facsimileTelephoneNumber',
+   '2.5.4.24'                    => 'x121Address',
+   '2.5.4.25'                    => 'internationalISDNNumber',
+   '2.5.4.26'                    => 'registeredAddress',
+   '2.5.4.27'                    => 'destinationIndicator',
+   '2.5.4.28'                    => 'preferredDeliveryMehtod',
+   '2.5.4.29'                    => 'presentationAddress',
+   '2.5.4.30'                    => 'supportedApplicationContext',
+   '2.5.4.31'                    => 'member',
+   '2.5.4.32'                    => 'owner',
+   '2.5.4.33'                    => 'roleOccupant',
+   '2.5.4.34'                    => 'seeAlso',
+   '2.5.4.35'                    => 'userPassword',
+   '2.5.4.36'                    => 'userCertificate',
+   '2.5.4.37'                    => 'caCertificate',
+   '2.5.4.38'                    => 'authorityRevocationList',
+   '2.5.4.39'                    => 'certificateRevocationList',
+   '2.5.4.40'                    => 'crossCertificatePair',
+   '2.5.4.41'                    => 'givenName',
+   '2.5.4.42'                    => 'givenName',
+   '2.5.4.52'                    => 'supportedAlgorithms',
+   '2.5.4.53'                    => 'deltaRevocationList',
+   '2.5.4.58'                    => 'crossCertificatePair',
+   '2.5.8'                       => 'X.500-Algorithms',
+   '2.5.8.1'                     => 'X.500-Alg-Encryption',
+   '2.5.8.1.1'                   => 'rsa',
+   '2.5.29.1'                    => 'authorityKeyIdentifier',
+   '2.5.29.2'                    => 'keyAttributes',
+   '2.5.29.3'                    => 'certificatePolicies',
+   '2.5.29.4'                    => 'keyUsageRestriction',
+   '2.5.29.5'                    => 'policyMapping',
+   '2.5.29.6'                    => 'subtreesConstraint',
+   '2.5.29.7'                    => 'subjectAltName',
+   '2.5.29.8'                    => 'issuerAltName',
+   '2.5.29.9'                    => 'subjectDirectoryAttributes',
+   '2.5.29.10'                   => 'basicConstraints',
+   '2.5.29.11'                   => 'nameConstraints',
+   '2.5.29.12'                   => 'policyConstraints',
+   '2.5.29.13'                   => 'basicConstraints',
+   '2.5.29.14'                   => 'subjectKeyIdentifier',
+   '2.5.29.15'                   => 'keyUsage',
+   '2.5.29.16'                   => 'privateKeyUsagePeriod',
+   '2.5.29.17'                   => 'subjectAltName',
+   '2.5.29.18'                   => 'issuerAltName',
+   '2.5.29.19'                   => 'basicConstraints',
+   '2.5.29.20'                   => 'cRLNumber',
+   '2.5.29.21'                   => 'cRLReason',
+   '2.5.29.22'                   => 'expirationDate',
+   '2.5.29.23'                   => 'instructionCode',
+   '2.5.29.24'                   => 'invalidityDate',
+   '2.5.29.25'                   => 'cRLDistributionPoints',
+   '2.5.29.26'                   => 'issuingDistributionPoint',
+   '2.5.29.27'                   => 'deltaCRLIndicator',
+   '2.5.29.28'                   => 'issuingDistributionPoint',
+   '2.5.29.29'                   => 'certificateIssuer',
+   '2.5.29.30'                   => 'nameConstraints',
+   '2.5.29.31'                   => 'cRLDistributionPoints',
+   '2.5.29.32'                   => 'certificatePolicies',
+   '2.5.29.33'                   => 'policyMappings',
+   '2.5.29.34'                   => 'policyConstraints',
+   '2.5.29.35'                   => 'authorityKeyIdentifier',
+   '2.5.29.36'                   => 'policyConstraints',
+   '2.5.29.37'                   => 'extKeyUsage',
+   '2.16.840.1.101.2.1.1.1'      => 'sdnsSignatureAlgorithm',
+   '2.16.840.1.101.2.1.1.2'      => 'mosaicSignatureAlgorithm',
+   '2.16.840.1.101.2.1.1.3'      => 'sdnsConfidentialityAlgorithm',
+   '2.16.840.1.101.2.1.1.4'      => 'mosaicConfidentialityAlgorithm',
+   '2.16.840.1.101.2.1.1.5'      => 'sdnsIntegrityAlgorithm',
+   '2.16.840.1.101.2.1.1.6'      => 'mosaicIntegrityAlgorithm',
+   '2.16.840.1.101.2.1.1.7'      => 'sdnsTokenProtectionAlgorithm',
+   '2.16.840.1.101.2.1.1.8'      => 'mosaicTokenProtectionAlgorithm',
+   '2.16.840.1.101.2.1.1.9'      => 'sdnsKeyManagementAlgorithm',
+   '2.16.840.1.101.2.1.1.10'     => 'mosaicKeyManagementAlgorithm',
+   '2.16.840.1.101.2.1.1.11'     => 'sdnsKMandSigAlgorithm',
+   '2.16.840.1.101.2.1.1.12'     => 'mosaicKMandSigAlgorithm',
+   '2.16.840.1.101.2.1.1.13'     => 'SuiteASignatureAlgorithm',
+   '2.16.840.1.101.2.1.1.14'     => 'SuiteAConfidentialityAlgorithm',
+   '2.16.840.1.101.2.1.1.15'     => 'SuiteAIntegrityAlgorithm',
+   '2.16.840.1.101.2.1.1.16'     => 'SuiteATokenProtectionAlgorithm',
+   '2.16.840.1.101.2.1.1.17'     => 'SuiteAKeyManagementAlgorithm',
+   '2.16.840.1.101.2.1.1.18'     => 'SuiteAKMandSigAlgorithm',
+   '2.16.840.1.101.2.1.1.19'     => 'mosaicUpdatedSigAlgorithm',
+   '2.16.840.1.101.2.1.1.20'     => 'mosaicKMandUpdSigAlgorithms',
+   '2.16.840.1.101.2.1.1.21'     => 'mosaicUpdatedIntegAlgorithm',
+   '2.16.840.1.101.2.1.1.22'     => 'mosaicKeyEncryptionAlgorithm',
+   '2.16.840.1.101.3.4.2.1'      => 'sha256',
+   '2.16.840.1.101.3.4.2.2'      => 'sha384',
+   '2.16.840.1.101.3.4.2.3'      => 'sha512',
+   '2.16.840.1.113730.1'         => 'cert-extension',
+   '2.16.840.1.113730.1.1'       => 'netscape-cert-type',
+   '2.16.840.1.113730.1.2'       => 'netscape-base-url',
+   '2.16.840.1.113730.1.3'       => 'netscape-revocation-url',
+   '2.16.840.1.113730.1.4'       => 'netscape-ca-revocation-url',
+   '2.16.840.1.113730.2.5'       => 'netscape-cert-sequence',
+   '2.16.840.1.113730.2.6'       => 'netscape-cert-url',
+   '2.16.840.1.113730.1.7'       => 'netscape-cert-renewal-url',
+   '2.16.840.1.113730.1.8'       => 'netscape-ca-policy-url',
+   '2.16.840.1.113730.1.9'       => 'HomePage-url',
+   '2.16.840.1.113730.1.10'      => 'EntityLogo',
+   '2.16.840.1.113730.1.11'      => 'UserPicture',
+   '2.16.840.1.113730.1.12'      => 'netscape-ssl-server-name',
+   '2.16.840.1.113730.1.13'      => 'netscape-comment',
+   '2.16.840.1.113730.2'         => 'data-type',
+   '2.16.840.1.113730.2.1'       => 'GIF',
+   '2.16.840.1.113730.2.2'       => 'JPEG',
+   '2.16.840.1.113730.2.3'       => 'URL',
+   '2.16.840.1.113730.2.4'       => 'HTML',
+   '2.16.840.1.113730.2.5'       => 'CertSeq',
+   '2.16.840.1.113730.3'         => 'directory',
+   '2.16.840.1.113730.4.1'       => 'serverGatedCrypto',
+   '2.16.840.1.113733.1.6.3'     => 'Unknown Verisign extension',
+   '2.16.840.1.113733.1.6.6'     => 'Unknown Verisign extension',
+   '2.16.840.1.113733.1.7.1.1'   => 'Verisign certificatePolicy',
+   '2.16.840.1.113733.1.7.1.1.1' => 'Unknown Verisign policy qualifier',
+   '2.16.840.1.113733.1.7.1.1.2' => 'Unknown Verisign policy qualifier',
+   '2.23.42.0'                   => 'contentType',
+   '2.23.42.0.0'                 => 'PANData',
+   '2.23.42.0.1'                 => 'PANToken',
+   '2.23.42.0.2'                 => 'PANOnly',
+   '2.23.42.1'                   => 'msgExt',
+   '2.23.42.2'                   => 'field',
+   '2.23.42.2.0'                 => 'fullName',
+   '2.23.42.2.1'                 => 'givenName',
+   '2.23.42.2.2'                 => 'familyName',
+   '2.23.42.2.3'                 => 'birthFamilyName',
+   '2.23.42.2.4'                 => 'placeName',
+   '2.23.42.2.5'                 => 'identificationNumber',
+   '2.23.42.2.6'                 => 'month',
+   '2.23.42.2.7'                 => 'date',
+   '2.23.42.2.8'                 => 'address',
+   '2.23.42.2.9'                 => 'telephone',
+   '2.23.42.2.10'                => 'amount',
+   '2.23.42.2.7.11'              => 'accountNumber',
+   '2.23.42.2.7.12'              => 'passPhrase',
+   '2.23.42.3'                   => 'attribute',
+   '2.23.42.3.0'                 => 'cert',
+   '2.23.42.3.0.0'               => 'rootKeyThumb',
+   '2.23.42.3.0.1'               => 'additionalPolicy',
+   '2.23.42.4'                   => 'algorithm',
+   '2.23.42.5'                   => 'policy',
+   '2.23.42.5.0'                 => 'root',
+   '2.23.42.6'                   => 'module',
+   '2.23.42.7'                   => 'certExt',
+   '2.23.42.7.0'                 => 'hashedRootKey',
+   '2.23.42.7.1'                 => 'certificateType',
+   '2.23.42.7.2'                 => 'merchantData',
+   '2.23.42.7.3'                 => 'cardCertRequired',
+   '2.23.42.7.4'                 => 'tunneling',
+   '2.23.42.7.5'                 => 'setExtensions',
+   '2.23.42.7.6'                 => 'setQualifier',
+   '2.23.42.8'                   => 'brand',
+   '2.23.42.8.1'                 => 'IATA-ATA',
+   '2.23.42.8.4'                 => 'VISA',
+   '2.23.42.8.5'                 => 'MasterCard',
+   '2.23.42.8.30'                => 'Diners',
+   '2.23.42.8.34'                => 'AmericanExpress',
+   '2.23.42.8.6011'              => 'Novus',
+   '2.23.42.9'                   => 'vendor',
+   '2.23.42.9.0'                 => 'GlobeSet',
+   '2.23.42.9.1'                 => 'IBM',
+   '2.23.42.9.2'                 => 'CyberCash',
+   '2.23.42.9.3'                 => 'Terisa',
+   '2.23.42.9.4'                 => 'RSADSI',
+   '2.23.42.9.5'                 => 'VeriFone',
+   '2.23.42.9.6'                 => 'TrinTech',
+   '2.23.42.9.7'                 => 'BankGate',
+   '2.23.42.9.8'                 => 'GTE',
+   '2.23.42.9.9'                 => 'CompuSource',
+   '2.23.42.9.10'                => 'Griffin',
+   '2.23.42.9.11'                => 'Certicom',
+   '2.23.42.9.12'                => 'OSS',
+   '2.23.42.9.13'                => 'TenthMountain',
+   '2.23.42.9.14'                => 'Antares',
+   '2.23.42.9.15'                => 'ECC',
+   '2.23.42.9.16'                => 'Maithean',
+   '2.23.42.9.17'                => 'Netscape',
+   '2.23.42.9.18'                => 'Verisign',
+   '2.23.42.9.19'                => 'BlueMoney',
+   '2.23.42.9.20'                => 'Lacerte',
+   '2.23.42.9.21'                => 'Fujitsu',
+   '2.23.42.9.22'                => 'eLab',
+   '2.23.42.9.23'                => 'Entrust',
+   '2.23.42.9.24'                => 'VIAnet',
+   '2.23.42.9.25'                => 'III',
+   '2.23.42.9.26'                => 'OpenMarket',
+   '2.23.42.9.27'                => 'Lexem',
+   '2.23.42.9.28'                => 'Intertrader',
+   '2.23.42.9.29'                => 'Persimmon',
+   '2.23.42.9.30'                => 'NABLE',
+   '2.23.42.9.31'                => 'espace-net',
+   '2.23.42.9.32'                => 'Hitachi',
+   '2.23.42.9.33'                => 'Microsoft',
+   '2.23.42.9.34'                => 'NEC',
+   '2.23.42.9.35'                => 'Mitsubishi',
+   '2.23.42.9.36'                => 'NCR',
+   '2.23.42.9.37'                => 'e-COMM',
+   '2.23.42.9.38'                => 'Gemplus',
+   '2.23.42.10'                  => 'national',
+   '2.23.42.10.192'              => 'Japan',
+   '2.54.1775.2'                 => 'hashedRootKey',
+   '2.54.1775.3'                 => 'certificateType',
+   '2.54.1775.4'                 => 'merchantData',
+   '2.54.1775.5'                 => 'cardCertRequired',
+   '2.54.1775.6'                 => 'tunneling',
+   '2.54.1775.7'                 => 'setQualifier',
+   '2.54.1775.99'                => 'set-data',
+   );
+
+sub read_oids
+{
+   my $fn = shift @_;
+
+   undef %OID unless $fn =~ s/^\+//;   # -oid file replaces, -oid +file updates
+   open (OID, $fn) || return;
+   while (<OID>) {
+      chomp;
+      if (/{\s*(.*\d)\s*}\s*(.*)/) {
+         my $name = $2;
+         my $oid  = join ('.', split (/\s+/, $1));
+         $OID{$oid} = $name;
+      }
+   }
+   close (OID);
+}
+
+#==============================================================================#
+#                           b u f f e r   s t a c k                            #
+#==============================================================================#
+
+sub buf_stack
+{
+   my $buf   = shift @_;
+   my $tag   = shift @_;
+   my $class = shift @_;
+
+   return { buf=>$buf, tag=>$tag, class=>$class };
+}
+
+sub buf_unstack
+{
+   my $stack = shift @_;
+   my $buf   = shift @_;
+
+   return undef unless $stack;
+   return $stack->{buf}.
+          &asn_header ($stack->{class}, 1, $stack->{tag}, length ($buf)).
+          $buf;
+}
+
+#==============================================================================#
+#                                  i n p u t                                   #
+#==============================================================================#
+
+sub in_slurp
+   #---------------------------------------------------------------------------#
+   # usage: &in_slurp ($fn) || die "error: $error\n";                          #
+   #                                                                           #
+   # Processes $fn->{name}, reading the named file into $fn->{bin}.  There are #
+   # a few "magic" filenames that cause other behavior, including:             #
+   #    #xx    a single hex character                                          #
+   #    #seq   begin an ASN.1 sequence                                         #
+   #    #set   begin an ASN.1 set                                              #
+   #    #[nn]  begin an ASN.1 explicit context-specific tag                    #
+   #    #      end an ASN.1 contruct                                           #
+   #                                                                           #
+   # The ASN.1 "magic" types make use of the buffer stack and $fn->{command}.  #
+   # If $fn->{command} eq 'stack', $fn->{tag} and $fn->{class} are the ASN.1   #
+   # tag parameters to stack.  If $fn->{command} eq 'unstack', the ASN.1       #
+   # buffer is to be unstacked.                                                #
+   #                                                                           #
+   # Otherwise, processing continues by interpreting $fn->{raw} subject to     #
+   # $fn->{form}.                                                              #
+   #                                                                           #
+   # Returns undef and sets $error in case of error.                           #
+   #---------------------------------------------------------------------------#
+{
+   my $fn = shift @_;
+
+   if ($fn->{name} =~ /^#[0-9a-fA-F]{2}$/) {
+      #-----------------------------#
+      # Pseudo-filename #<hex char> #
+      #-----------------------------#
+      $fn->{raw} = chr (hex (substr ($fn->{name}, 1))) x ($len || 1);
+      $fn->{form} = 'bin';
+   } elsif ($fn->{name} eq '#seq') {
+      $fn->{command} = 'stack';
+      $fn->{tag}     = 16;
+      $fn->{class}   = 0;
+   } elsif ($fn->{name} eq '#set') {
+      $fn->{command} = 'stack';
+      $fn->{tag}     = 17;
+      $fn->{class}   = 0;
+   } elsif ($fn->{name} =~ /^#\[(\d+)\]$/) {
+      $fn->{command} = 'stack';
+      $fn->{tag}     = $1;
+      $fn->{class}   = 2;
+   } elsif ($fn->{name} eq '#') {
+      $fn->{command} = 'unstack';
+   } else {
+      #------------------------#
+      # Real file: open it ... #
+      #------------------------#
+      if (!open (IN, $fn->{name})) {
+         push @{$fn->{error}}, "can not open $fn->{name}: $!";
+         return undef;
+      }
+      binmode (IN);
+      $fn->{raw} = join ('', <IN>);
+      close (IN);
+   }
+   return 1;
+}
+
+sub in_type
+   #---------------------------------------------------------------------------#
+   # usage: $fn->{form} = &in_type ($fn);                                      #
+   #                                                                           #
+   # Returns the apparent type of $fn->{raw}.                                  #
+   #---------------------------------------------------------------------------#
+{
+   my $fn = shift @_;
+   
+   my $look = (split ("\n", $fn->{raw}, 2)) [0];
+   return 'hex' if $look =~ /^[A-Fa-f0-9]+\s*$/;
+   return 'b64' if $look =~ m|^[A-Za-z0-9+/]+={0,2}\s*$|;
+   return 'b64' if $fn->{raw} =~ /-----BEGIN/;
+   return 'bin';
+}
+
+sub in_decode
+   #---------------------------------------------------------------------------#
+   # usage: &in_decode ($fn);                                                  #
+   #                                                                           #
+   # Sets $fn->{buf} from $fn->{raw} and $fn->{form}.  If $fn->{command} is    #
+   # set, no decoding takes place and $fn->{buf} will not be set.              #
+   #                                                                           #
+   # May push informational messages onto @{$fn->{note}} or error messages     #
+   # onto @{$fn->{error}} as appropriate.                                      #
+   #---------------------------------------------------------------------------#
+{
+   my $fn = shift @_;
+   
+   return if defined $fn->{command};
+   if ($fn->{form} eq 'b64') {
+      (my $raw = $fn->{raw}) =~ s/.*(?=-----BEGIN)//;
+      for (split ("\n", $raw)) {
+         s/\s+$//;
+         $fn->{buf} .= &decode_b64 ($_, $fn->{error})
+            if m|^[A-Za-z0-9+/]+={0,2}$|;
+      }
+   } elsif ($fn->{form} eq 'hex') {
+      for (split ("\n", $fn->{raw})) {
+         s/\s+$//;
+         $fn->{buf} .= &decode_hex ($_, $fn->{error})
+            if /^[A-Fa-f0-9]+$/;
+      }
+   } else { # bin
+      $fn->{buf} = $fn->{raw};
+   }
+}
+
+sub in_edit
+   #---------------------------------------------------------------------------#
+   # usage: &in_edit ($fn);                                                    #
+   #                                                                           #
+   # Edits $fn->{buf} according to the edit flags set by parse_filename:       #
+   #   $fn->{off}           substring by offset...                             #
+   #   $fn->{len}           ...and/or length (before ASN.1 processing)         #
+   #   $fn->{asn}           ASN.1 parse and type the buffer                    #
+   #   $fn->{'asn.type'}    indicates the ASN.1 type (auto selected if blank)  #
+   #   $fn->{'asn.field'}   substring by ASN.1 field name                      #
+   #   $fn->{'asn.off'}     substring by offset...                             #
+   #   $fn->{'asn.len'}     ...and/or length (after field substring)`          #
+   #                                                                           #
+   # May push informational messages onto @{$fn->{note}} or error messages     #
+   # onto @{$fn->{error}} as appropriate.                                      #
+   #---------------------------------------------------------------------------#
+{
+   my $fn = shift @_;
+
+   #--------------------------#
+   # substring (if necessary) #
+   #--------------------------#
+   $fn->{buf} = substr ($fn->{buf}, $fn->{off}) if $fn->{off};
+   $fn->{buf} = substr ($fn->{buf}, 0, $fn->{len}) if $fn->{len};
+
+   #-----------------------------------#
+   # asn type and parse (if necessary) #
+   #-----------------------------------#
+   if ($fn->{asn}) {
+      my $aoff    = 0;
+      my $asn     = &asn_parse (\$fn->{buf}, \$aoff, length ($fn->{buf}));
+      my $symbols = {};
+      my $atype   = $fn->{'asn.type'};
+      my $aforce  = 1 if defined $atype and $atype =~ s/force$//;
+      if (!$atype) {
+         $fn->{'asn.type'} = &asn_auto_type ($asn, \$fn->{buf}, $symbols);
+         if ($fn->{'asn.type'}) {
+            push @{$fn->{note}},
+               "ASN.1 type \"".$fn->{'asn.type'}."\" selected for $fn->{name}";
+         } else {
+            push @{$fn->{error}}, "an ASN.1 type for $fn->{name} was not found";
+            return;
+         }
+      } else {
+         if (!&asn_match ($asn, \$fn->{buf}, $atype, $symbols)) {
+            if ($aforce) {
+                push @{$fn->{note}}, "$fn->{name} does not appear to match".
+                                      " \"$atype\"";
+            } else {
+                push @{$fn->{error}}, "$fn->{name} does not appear to match".
+                                      " \"$atype\"";
+                return;
+             }
+         }
+      }
+
+      #-------------------------#
+      # ...and asn field select #
+      #-------------------------#
+      if ($fn->{'asn.field'}) {
+         my ($off, $len);
+         ($off, $len) = &asn_lookup ($fn->{'asn.field'}, $symbols);
+         if ($off < 0) {
+            push @{$fn->{error}}, $len;
+            return;
+         }
+         $fn->{buf} = substr ($fn->{buf}, $off, $len);
+      }
+
+      #----------------------#
+      # ...and asn substring #
+      #----------------------#
+      $fn->{buf} = substr ($fn->{buf}, $fn->{'asn.off'}) if $fn->{'asn.off'};
+      $fn->{buf} = substr ($fn->{buf}, 0, $fn->{'asn.len'}) if $fn->{'asn.len'};
+   }
+}
+
+sub in_file
+   #---------------------------------------------------------------------------#
+   # usage: &in_file ($fn, \$buf, \@buf);                                      #
+   #                                                                           #
+   # Processes the input file spec in $fn, appending to the $buf buffer or     #
+   # manipulating the buffer stack @buf if $fn->{command} is set.              #
+   #---------------------------------------------------------------------------#
+{
+   my $fn     = shift @_;
+   my $pbuf   = shift @_;
+   my $pstack = shift @_;
+
+   if (&in_slurp ($fn)) {
+      if ($fn->{command} eq 'stack') {
+         push @$pstack, &buf_stack ($$pbuf, $fn->{tag}, $fn->{class});
+         $$pbuf = '';
+      } elsif ($fn->{command} eq 'unstack') {
+         $$pbuf = &buf_unstack (pop @$pstack, $$pbuf);
+         push @{$fn->{error}}, "error: unmatched #" unless $$pbuf;
+      } else {
+         if (!$fn->{form} or $fn->{auto}) {
+            $fn->{form} = &in_type ($fn);
+            push @{$fn->{note}},
+                 "encoding $fn->{form} selected for $fn->{name}";
+         }
+         &in_decode ($fn);
+         &in_edit ($fn);
+         $$pbuf .= $fn->{buf};
+      }
+   }
+}
+
+#==============================================================================#
+#                                 o u t p u t                                  #
+#==============================================================================#
+
+sub out_file
+   #---------------------------------------------------------------------------#
+   # usage: @obuf = &out_file ($output, $ibuf, \@error, \@note);               #
+   #                                                                           #
+   # Processes the output spec in $output to format $ibuf, returning the data  #
+   # as an array of output lines to be printed.  Pushes errors and notes onto  #
+   # @error/@note.                                                             #
+   #---------------------------------------------------------------------------#
+{
+   my $output = shift @_;
+   my $ibuf   = shift @_;
+   my $error  = shift @_;
+   my $note   = shift @_;
+
+   my @obuf;
+
+   #------------------------#
+   # Select output encoding #
+   #------------------------#
+   if (!($output->{asn} or $output->{form}) or $output->{auto}) {
+      if ($opt_asn or &asn_string ($ibuf)) {
+         $output->{asn} = 1;
+         push @$note, "asn encoding selected for output";
+      } elsif ($output->{name} eq '-' or $output->{auto}) {
+         $output->{form} = 'dump';
+         push @$note, "formatted dump encoding selected for output";
+      } else {
+         $output->{form} = 'bin';
+         push @$note, "binary encoding selected for output";
+      }
+   }
+
+   #---------------#
+   # Format output #
+   #---------------#
+   if ($output->{asn}) {
+      my $offset  = 0;
+      my $asn     = &asn_parse (\$ibuf, \$offset, length ($ibuf));
+      my $warn    = '';
+      my $symbols = {};
+
+      #------------------------------#
+      # ASN type: auto type or match #
+      # the user's selection.        #
+      #------------------------------#
+      if (!$output->{'asn.type'}) {
+         $output->{'asn.type'} = &asn_auto_type ($asn, \$ibuf, $symbols);
+         if ($output->{'asn.type'}) {
+            push @$note, "ASN.1 type \"".$output->{'asn.type'}.
+                         "\" selected for output";
+         }
+      } elsif (!$asn_pats{$output->{'asn.type'}}) {
+         push @$error, "warning: unknown ASN.1 type \"".
+                       $output->{'asn.type'}."\"";
+      } elsif (!&asn_match ($asn, \$ibuf, $output->{'asn.type'}, $symbols)) {
+         push @$error, "warning: ASN.1 match with \"".
+                       $output->{'asn.type'}."\" incomplete";
+      }
+
+      #---------------------#
+      # ASN output: 2 forms #
+      #---------------------#
+      if ($output->{'asn.off'} == 0) {
+         #----------------------------#
+         # 0 (default): annotated asn #
+         #----------------------------#
+         push @obuf, &asn_format ($asn, \$ibuf);
+      } else { # $output->{'asn.off'} == 1
+         #----------------------#
+         # 1: symbol table dump #
+         #----------------------#
+         my @keys = sort {$symbols->{$a}{off} <=> $symbols->{$b}{off} ||
+                          length($a)          <=> length($b)}
+                         grep (/^[a-zA-Z]/, keys %$symbols);
+         my @fields = @keys;
+         grep {s/[^\.]+\./. /g} @fields;
+         push @obuf,
+              &column_print (['field', @fields],
+                             ['value', map {&asn_format_short ($symbols->{$_},
+                                                               \$ibuf)}
+                                           @keys]);
+      }
+   } elsif ($output->{form} eq 'dump') {
+      push @obuf, &dump ($ibuf);
+   } elsif ($output->{form} eq 'b64') {
+      if (!$output->{'b64.type'}) {
+         my $asn      = &asn_parse (\$ibuf, \$offset, length ($ibuf));
+         my $asn_type = &asn_auto_type ($asn, \$ibuf, {});
+         $output->{'b64.type'} = $asn_auto_types{$asn_type};
+         if ($output->{'b64.type'}) {
+            push @$note, "PEM type \"".$output->{'b64.type'}.
+                         "\" selected for output\n";
+         }
+      } else {
+         $output->{'b64.type'} =~ tr/_/ /;
+      }
+      push @obuf, "-----BEGIN $output->{'b64.type'}-----"
+         if $output->{'b64.type'};
+      push @obuf, &encode_b64 ($ibuf);
+      push @obuf, "-----END $output->{'b64.type'}-----"
+         if $output->{'b64.type'};
+   } elsif ($output->{form} eq 'hex') {
+      push @obuf, &encode_hex ($ibuf);
+   } elsif ($output->{form} eq 'HEX') {
+      push @obuf, uc &encode_hex ($ibuf);
+   } else {  #  ($output->{form} eq 'bin')
+      push @obuf, $ibuf;
+   }
+
+   return @obuf;
+}
+
+sub out_print
+   #---------------------------------------------------------------------------#
+   # usage: &out_print ($output, \@s, \@error, \@note);                        #
+   #                                                                           #
+   # Opens $output->{name} and prints @s to it, stacking errors and notes to   #
+   # @error and @note.                                                         #
+   #---------------------------------------------------------------------------#
+{
+   my $output = shift @_;
+   my $s      = shift @_;
+   my $error  = shift @_;
+   my $note   = shift @_;
+
+   if (open (OUT, ">$output->{name}")) {
+      if ($output->{form} eq 'bin') {
+         binmode (OUT);
+         for $buf (@$s) {
+            syswrite (OUT, $buf);
+         }
+      } else {
+         for $buf (@$s) {
+            print OUT $buf;
+            print OUT "\n" unless $opt_n;
+         }
+      }
+      close (OUT);
+   } else {
+      push @$error, "cannot create output file $output->{name}: $!";
+   }
+}
+
+#==============================================================================#
+#                           c o m m a n d   l i n e                            #
+#==============================================================================#
+
+#--------------------#
+# Usage Instructions #
+#--------------------#
+
+($PROGRAM = $0) =~ s/.*[\/\\]//;
+$USAGE=<<".";
+
+usage: $PROGRAM: [options] [file...]
+
+options: -in    file,...  alternate input file specifications
+         -out   file      write unformatted output to file
+         -help            display this message and exit
+         -oid   file      use alternate OID file (use nul to inhibit OID names)
+         -oid   +file     add additional OID file
+         -n               supress \\n at end of output
+         -q               suppress notes and errors (like 2>/dev/null)
+         -v               display version history and exit
+
+file:    All file names may carry an optional [suboptions] suffix.  Valid
+         subobtions on input files are:
+            offset:length      substring (both offset and length are optional)
+            b64                base64 decode the file
+            hex                decode from hex
+            bin                treat the file as binary (default)
+            asn[:type][.field] map asn.1 "type" and select "field"
+         Valid suboptions on the output file are:
+            b64                base64 encode the output
+            hex                encode to hex
+            bin                create a new binary file
+            dump               format a dump report in hex and ascii
+            asn[:type][,mode]  asn dump (with "type" tags or autotype)
+                               use ,1 to list fields for input selectors
+         Use - as a filename to supply options for STDIN or STDOUT.
+         Use #xx or #xx[:len] as a filename to insert len hex xx characters
+
+default: Default input format is:
+            [b64]    if the input "looks like" base64 or has a PEM header
+            [hex]    if the input is all hex characters [0-9a-fA-F]
+            [bin]    otherwise
+         Default output format is:
+            [asn]    if the input "looks like" asn.1, otherwise
+            [bin]    if the output is to a file, otherwise
+            [dump]   if the output is to STDOUT
+
+example: To base64 encode the first 1K of x.bin into x.b64:
+            dump -in x.bin[:0x400] -out x.b64[b64]
+         To format a dump of the end half of the resulting output file:
+            dump -in x.b64[512:,b64] -out -[dump]
+         Note: since -out -[dump] is the default, this could be omitted.
+         To extract the public key modulus from a certificate:
+            dump -in file.cer[asn:cert.tbs.pubkey.key.n.value] -out file.n[bin]
+.
+
+sub cmd_input
+   #---------------------------------------------------------------------------#
+   # usage: $s = &cmd_input (\@input, \@error, \@note);                        #
+   #                                                                           #
+   # Read input files from @input.  Push errors and notes onto @error/@note.   #
+   # Returns binary input buffer (but beware of errors on @error).             #
+   #---------------------------------------------------------------------------#
+{
+   my $input = shift @_;
+   my $error = shift @_;
+   my $note  = shift @_;
+
+   my $s;
+   my @stack;
+
+   unshift (@$input, '-[bin]') unless @$input;
+   for $arg (@$input) {
+      my $fn = &parse_filename ($arg, {bin  => 1,
+                                       b64  => 1,
+                                       hex  => 1,
+                                       asn  => 2,
+                                       auto => 2});
+      &in_file ($fn, \$s, \@stack) unless defined $fn->{error};
+      push @$note,  @{$fn->{note}}  if @{$fn->{note}};
+      push @$error, @{$fn->{error}} if @{$fn->{error}};
+   }
+   $s = &buf_unstack (pop @stack, $s) while @stack;
+
+   return $s;
+}
+
+sub cmd_output
+   #---------------------------------------------------------------------------#
+   # usage: $s = &cmd_output ($outfn, $ibuf, \@error, \@note);                 #
+   #                                                                           #
+   # Processes the output spec in $outfn to format $ibuf, returning the data   #
+   # as a string to be printed.  Pushes errors and notes onto @error/@note.    #
+   #---------------------------------------------------------------------------#
+{
+   my $outfn = shift @_;
+   my $ibuf  = shift @_;
+   my $error = shift @_;
+   my $note  = shift @_;
+
+   my $output = &parse_filename ($outfn, {bin  => 1,
+                                          b64  => 1,
+                                          hex  => 1,
+                                          HEX  => 1,
+                                          dump => 1,
+                                          asn  => 2,
+                                          auto => 2});
+
+   my @obuf;
+   if (defined $output->{error}) {
+      push @$error, @{$output->{error}};
+   } else {
+      @obuf = &out_file ($output, $ibuf, $error, $note);
+   }
+   if (!@$error) {
+      &out_print ($output, \@obuf, $error, $note);
+   }
+}
+
+sub cmd_driver
+   #---------------------------------------------------------------------------#
+   # usage: &cmd_driver;                                                       #
+   #                                                                           #
+   # Read ARGV and process accordingly.                                        #
+   #---------------------------------------------------------------------------#
+{
+   my @error;
+   my @note;
+   my @info;
+   my $s;
+
+   #-----------------------------#
+   # Command line and easy outs. #
+   #-----------------------------#
+   if (!&Getopts ('{in}@{out}:{err}:Vv{help}{oid}:d:{asn}nq', \@error)
+       || $opt_help) {
+      push @info, $USAGE;
+   }
+
+   push @info, $V       if $opt_V;
+   push @info, $VERSION if $opt_v;
+
+   #---------------------#
+   # OID override option #
+   #---------------------#
+   if (!(@error or @info)) {
+      &read_oids ($opt_oid) if $opt_oid;
+   }
+
+   #-------------#
+   # Read inputs #
+   #-------------#
+   if (!(@error or @info)) {
+      $s = &cmd_input ([@opt_in, @ARGV], \@error, \@note);
+   }
+
+   #--------------#
+   # Print output #
+   #--------------#
+   if (!(@error or @info)) {
+      &cmd_output ($opt_out || '-', $s, \@error, \@note);
+   }
+
+   #-------------------#
+   # Print diagnostics #
+   #-------------------#
+   if (!$opt_q and (@error or @note or @info)) {
+      if (!($opt_err and open (ERR, ">$opt_err"))) {
+         open (ERR, ">&STDERR");
+      }
+
+      print ERR 'note: '. join ("\nnote: ",  @note)."\n"  if @note;
+      print ERR 'error: '.join ("\nerror: ", @error)."\n" if @error;
+      print ERR           join ("\n",        @info)."\n"  if @info;
+      close (ERR);
+   }
+}
+
+#==============================================================================#
+#                                    c g i                                     #
+#==============================================================================#
+
+use CGI ':standard';
+use HTML::Entities;
+
+sub cgi_load_file
+   #---------------------------------------------------------------------------#
+   # usage: $buffer = &cgi_load_file ('name');                                 #
+   #                                                                           #
+   # Slurps the whole file in param('name') in binmode and returns its         #
+   # content.  Uses param('name') as a file handle.                            #
+   #---------------------------------------------------------------------------#
+{
+   my $field = shift @_;
+   my $fh    = param($field);
+   my $buf;
+
+   binmode ($fh);
+   while (read ($fh,$buf,1024,length($buf))) {};
+   return $buf;
+}
+
+sub cgi_in_params
+   #---------------------------------------------------------------------------#
+   # usage: $hashref = &cgi_in_params;                                         #
+   #                                                                           #
+   # Parses the CGI form parameters describing the input as follows:           #
+   #   dump    => the name of the filename to upload (see &cgi_load_file)      #
+   #   xdump   => base64 text pasted into the input area                       #
+   #   in      => the input encoding (auto, b64, hex, binary)                  #
+   #   inoff   => the input substring offset                                   #
+   #   inlen   => the input substring length                                   #
+   #   inasn   => the input ASN.1 named "field" substring                      #
+   #                                                                           #
+   # Returns a hashref containing the following keys:                          #
+   #   name      => filename                                                   #
+   #   raw       => the encoded bytestream                                     #
+   #   form      => the file format (b64, hex, bin, or absent for auto-type)   #
+   #   auto      => automatically select form                                  #
+   #   off       => offset                                                     #
+   #   len       => length                                                     #
+   #   asn       => ASN.1 processing flag                                      #
+   #   asn.field => pieces of asn syntax found as above                        #
+   #   error     => ARRAYREF placeholder for error messages                    #
+   #   note      => ARRAYREF placeholder for notes and warnings                #
+   #                                                                           #
+   # Returns a HASHREF suitable for processing by &in_edit.                    #
+   #---------------------------------------------------------------------------#
+{
+   my $rc    = {};
+
+   $rc->{name} = param ('dump') || 'pasted text';
+   $rc->{raw}  = &cgi_load_file ('dump') || param('xdump');
+   $rc->{off}  = param ('inoff') if param ('inoff');
+   $rc->{len}  = param ('inlen') if param ('inlen');
+   if (param ('in') eq 'auto') {
+      $rc->{auto} = 1;
+   } elsif (param ('in')) {
+      $rc->{form} = param ('in') eq 'binary' ? 'bin' : param ('in');
+   }
+   if (param ('inasn')) {
+      $rc->{asn} = 1;
+      $rc->{'asn.field'} = param ('inasn');
+   }
+   $rc->{note}  = [];
+   $rc->{error} = [];
+
+   #---------------------------#
+   # Identrus plugin detection #
+   #---------------------------#
+   if (!$rc->{raw} && param('Signature')) {
+      $rc->{raw} = param('Signature');
+      $rc->{name} = 'identrus signing plugin';
+   }
+
+   return $rc;
+}
+
+sub cgi_out_params
+   #---------------------------------------------------------------------------#
+   # usage: $hashref = &cgi_out_params;                                        #
+   #                                                                           #
+   # Parses the CGI form parameters describing the desired output as follows:  #
+   #   out     => the output encoding (auto, b64, hex, binary,                 #
+   #                                   dump, asn, asn map)                     #
+   #   outasn  => auto or the ASN.1 type that the output should match          #
+   #                                                                           #
+   # Returns a hashref containing the following keys:                          #
+   #   name      => filename (- for stdout)                                    #
+   #   form      => the output encoding format (b64, hex, bin, dump)           #
+   #   auto      => auto select the output form                                #
+   #   asn       => ASN.1 processing flag (overrides form)                     #
+   #   asn.type  => ASN.1 type that the output should match                    #
+   #   asn.off   => ASN.1 output format flag: 0=full, 1=asn map                #
+   #                                                                           #
+   # Returns a HASHREF suitable for processing by &out_file.                   #
+   #---------------------------------------------------------------------------#
+{
+   my $rc    = {};
+
+   $rc->{name} = '-';
+   if (param ('Signature')) {
+      $rc->{form} = 'dump';  # force Identrus mode to dump
+   } elsif (param ('out') =~ /^asn/ or param ('outasn') ne 'auto') {
+      $rc->{asn}  = 1;
+      $rc->{'asn.type'} = param ('outasn') if param ('outasn') ne 'auto';
+      $rc->{'asn.off'} = 1 if param ('out') eq 'asn map';
+
+      return $rc;
+   } elsif (param ('out') eq 'binary') {
+      $rc->{form} = 'bin';
+   } elsif (param ('out') eq 'auto') {
+      $rc->{auto} = 1;
+   } else {
+      $rc->{form} = param ('out');
+   }
+
+   return $rc;
+}
+
+sub print_header
+   #---------------------------------------------------------------------------#
+   # usage: &print_header;                                                     #
+   #---------------------------------------------------------------------------#
+{
+   print
+      header,
+      start_html(-title   => "Universal Dump Utility $V",
+                 -style   => {'src' => '/johnt.css'}),
+      h1("Universal Dump Utility $V");
+}
+
+sub print_footer
+   #---------------------------------------------------------------------------#
+   # usage: &print_footer;                                                     #
+   #---------------------------------------------------------------------------#
+{
+   print
+      end_html;
+}
+
+sub print_form
+   #---------------------------------------------------------------------------#
+   # usage: &print_form ($pem);                                                #
+   #---------------------------------------------------------------------------#
+{
+   my $pem = shift @_;
+
+   print
+      start_multipart_form,
+      table ({-border=>1,-cellpadding=>1, -cellspacing=>0},
+         Tr ({-align=>LEFT, -valign=>TOP},
+            td ({-colspan=>2},
+               table ({-cellpadding=>0, -cellspacing=>0, -width=>'100%'},
+                  Tr ({-align=>LEFT, -valign=>MIDDLE},
+                  [
+                     th ('Filename'),
+                     td ({class=>TRodd},
+                        filefield (-name      => 'dump',
+                                   -default   => param('dump'),
+                                   -size      => 50,
+                                   -maxlength => 80)),
+                  ])))),
+         Tr ({-align=>LEFT, -valign=>TOP},
+            td ({-colspan=>2},
+               table ({-cellpadding=>0, -cellspacing=>0, -width=>'100%'},
+                  Tr ({-align=>LEFT, -valign=>MIDDLE},
+                  [
+                     th ('...or paste file below'),
+                     td ({class=>TRodd},
+                        '<textarea name="xdump" rows="10" cols="64">'.$pem.
+                        '</textarea>'),
+                  ])))),
+         Tr ({-align=>LEFT, -valign=>TOP},
+            td (
+            [
+               table ({-cellpadding=>0, -cellspacing=>0, -width=>'100%'},
+                  Tr ({-align=>LEFT, -valign=>MIDDLE},
+                  [
+                     th ({-colspan=>2}, 'Input Options'),
+                     td ({-class=>TRodd},
+                     [
+                        " Encoding: ",
+                        popup_menu(-name      => 'in',
+                                   -values    => ['auto', 'b64',
+                                                  'hex', 'binary'],
+                                   -default => 'auto'),
+                     ]  ),
+                     td ({-class=>TReven},
+                     [
+                        " Offset:Length: ",
+                        textfield (-name      => 'inoff',
+                                   -size      => 5,
+                                   -maxlength => 15).
+                        ':'.
+                        textfield (-name      => 'inlen',
+                                   -size      => 5,
+                                   -maxlength => 15),
+                     ]  ),
+                     td ({-class=>TRodd},
+                     [
+                        " ASN.1 sub-attribute: ",
+                        textfield (-name      => 'inasn',
+                                   -size      => 20,
+                                   -maxlength => 50),
+                     ]  ),
+                  ])),
+               table ({-cellpadding=>0, -cellspacing=>0, -width=>'100%'},
+                  Tr ({-align=>LEFT, -valign=>MIDDLE},
+                  [
+                     th ({-colspan=>2}, 'Output Options'),
+                     td ({-class=>TRodd},
+                     [
+                        " Encoding: ",
+                        popup_menu(-name      => 'out',
+                                   -values    => ['auto', 'dump', 'asn',
+                                                  'asn map', 'b64',
+                                                  'hex', 'binary'],
+                                   -default => 'auto'),
+                     ]  ),
+                     td ({-class=>TReven},
+                     [
+                        " ASN.1 type: ",
+                        popup_menu(-name      => 'outasn',
+                                   -values    => ['auto', 'cert', 'crl',
+                                                  'ocsp-request',
+                                                  'ocsp-response',
+                                                  'scvp-request',
+                                                  'scvp-response',
+                                                  'scvp-response-03',
+                                                  'p7', 'p10'],
+                                   -default => 'auto'),
+                     ]  ),
+                  ])),
+            ]))),
+      br,
+      submit ('Dump File'),
+      end_form,
+      hr;
+}
+
+sub cgi_dump
+   #---------------------------------------------------------------------------#
+   # usage: &cgi_dump;                                                         #
+   #                                                                           #
+   # Dumps param as a table.                                                   #
+   #---------------------------------------------------------------------------#
+{
+   my $class = "TRodd";
+
+   print <<".";
+      <table border="1" cellpadding="1" cellspacing="0">
+         <tr align="LEFT" valign="TOP">
+            <td>
+               <table cellpadding="1" cellspacing="0" width="100%">
+                  <tr align="LEFT" valign="MIDDLE">
+                     <th colspan="2">POST Parameters</th></tr>
+.
+   for $p (param()) {
+      print "<tr class=\"$class\" align=\"LEFT\" valign=\"TOP\"><th>$p</th>",
+            "<td><pre>",
+            param($p),
+            "</pre></td></tr>\n";
+      $class = $class eq 'TRodd' ? 'TReven' : 'TRodd';
+   }
+   print "</table></td></tr></table>\n";
+}
+
+sub cgi_driver
+   #---------------------------------------------------------------------------#
+   # usage: &cgi_driver;                                                       #
+   #                                                                           #
+   # Throws up a CGI form to drive dump, and processes the form's commands     #
+   # when it is filled out.                                                    #
+   #---------------------------------------------------------------------------#
+{
+   &print_header;
+   if (param()) {
+      my $in   = &cgi_in_params;
+      my $out  = &cgi_out_params;
+      my @output;
+
+      if ($in->{raw}) {
+         if (!$in->{form} or $in->{form} eq 'auto') {
+            $in->{form} = &in_type ($in);
+            push @{$in->{note}},
+                 "encoding $in->{form} selected for $in->{name}";
+         }
+         &in_decode ($in);
+         &in_edit ($in);
+      }
+
+      &print_form (join ("\n", &encode_b64 ($in->{buf})));
+
+      if ($in->{buf}) {
+         @output = &out_file ($out, $in->{buf}, $in->{error}, $in->{note});
+
+         print "File: ",strong($in->{name}),
+               hr;
+      }
+
+      if (@{$in->{error}} or @{$in->{note}}) {
+         print join ("<br>", (map {encode_entities ($_)} @{$in->{note}}),
+                             (map {b (encode_entities ($_))} @{$in->{error}})),
+               hr;
+      }
+
+      if (@output) {
+         print pre (encode_entities (join ("\n", @output))),
+               hr;
+      } elsif (!param('Dump File')) {
+         # strange foreign post
+         &cgi_dump;
+      }
+   } else {
+      &print_form;
+   }
+   &print_footer;
+}
+
+#==============================================================================#
+#                                   m a i n                                    #
+#==============================================================================#
+
+if ($ENV{GATEWAY_INTERFACE}) {
+   &cgi_driver;
+} else {
+   &cmd_driver;
+}
