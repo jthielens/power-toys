@@ -5,6 +5,7 @@
 $VERSION = <<"";
 Version Description                        Date   Who
 ------- ---------------------------------- ------ ---
+1.2.15  remove HTML::Entities dependency   140314 jbt
 1.2.14  cleanup some modern perl warnings  140313 jbt
 1.2.13  asn:typeforce, -n output           070323 jbt
 1.2.12  crldp extensions, openssl -text    030212 jbt
@@ -3366,7 +3367,21 @@ sub cmd_driver
 #==============================================================================#
 
 use CGI ':standard';
-use HTML::Entities;
+
+sub encode_entities
+   #---------------------------------------------------------------------------#
+   # usage: $string = &encode_entities ($string);                              #
+   #                                                                           #
+   # Protects &"<> in $string with their entity encodings.                     #
+   #---------------------------------------------------------------------------#
+{
+   my $s = shift @_;
+   $s =~ s/&/&amp;/g;
+   $s =~ s/"/&quot;/g;
+   $s =~ s/</&lt;/g;
+   $s =~ s/>/&gt;/g;
+   return $s;
+}
 
 sub cgi_load_file
    #---------------------------------------------------------------------------#
