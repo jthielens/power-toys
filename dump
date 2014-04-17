@@ -5,6 +5,7 @@
 $VERSION = <<"";
 Version Description                        Date   Who
 ------- ---------------------------------- ------ ---
+1.2.16  dump:ebcdic                        140417 jbt
 1.2.15  remove HTML::Entities dependency   140314 jbt
 1.2.14  cleanup some modern perl warnings  140313 jbt
 1.2.13  asn:typeforce, -n output           070323 jbt
@@ -403,10 +404,28 @@ sub column_print
 #                                   d u m p                                    #
 #==============================================================================#
 
+$cp_037 =
+    '\x00\x01\x02\x03\x37\x2D\x2E\x2F\x16\x05\x25\x0B\x0C\x0D\x0E\x0F' .
+    '\x10\x11\x12\x13\x3C\x3D\x32\x26\x18\x19\x3F\x27\x1C\x1D\x1E\x1F' .
+    '\x40\x5A\x7F\x7B\x5B\x6C\x50\x7D\x4D\x5D\x5C\x4E\x6B\x60\x4B\x61' .
+    '\xF0\xF1\xF2\xF3\xF4\xF5\xF6\xF7\xF8\xF9\x7A\x5E\x4C\x7E\x6E\x6F' .
+    '\x7C\xC1\xC2\xC3\xC4\xC5\xC6\xC7\xC8\xC9\xD1\xD2\xD3\xD4\xD5\xD6' .
+    '\xD7\xD8\xD9\xE2\xE3\xE4\xE5\xE6\xE7\xE8\xE9\xBA\xE0\xBB\xB0\x6D' .
+    '\x79\x81\x82\x83\x84\x85\x86\x87\x88\x89\x91\x92\x93\x94\x95\x96' .
+    '\x97\x98\x99\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xC0\x4F\xD0\xA1\x07' .
+    '\x20\x21\x22\x23\x24\x15\x06\x17\x28\x29\x2A\x2B\x2C\x09\x0A\x1B' .
+    '\x30\x31\x1A\x33\x34\x35\x36\x08\x38\x39\x3A\x3B\x04\x14\x3E\xFF' .
+    '\x41\xAA\x4A\xB1\x9F\xB2\x6A\xB5\xBD\xB4\x9A\x8A\x5F\xCA\xAF\xBC' .
+    '\x90\x8F\xEA\xFA\xBE\xA0\xB6\xB3\x9D\xDA\x9B\x8B\xB7\xB8\xB9\xAB' .
+    '\x64\x65\x62\x66\x63\x67\x9E\x68\x74\x71\x72\x73\x78\x75\x76\x77' .
+    '\xAC\x69\xED\xEE\xEB\xEF\xEC\xBF\x80\xFD\xFE\xFB\xFC\xAD\xAE\x59' .
+    '\x44\x45\x42\x46\x43\x47\x9C\x48\x54\x51\x52\x53\x58\x55\x56\x57' .
+    '\x8C\x49\xCD\xCE\xCB\xCF\xCC\xE1\x70\xDD\xDE\xDB\xDC\x8D\x8E\xDF';
+
 sub dump
    #---------------------------------------------------------------------------#
-   # usage 1: @output = &dump ($buf);                                          #
-   # usage 2: &dump ($buf, FILE);                                              #
+   # usage 1: @output = &dump ($buf [,$type]);                                 #
+   # usage 2: &dump ($buf, $type, FILE);                                       #
    #                                                                           #
    # Formats $buf as a sequence of dump lines representing 16 bytes each:      #
    #    xxxx |00112233 44556677 8899AABB CCDDEEFF|*|0123456789ABCDEF|          #
@@ -420,6 +439,7 @@ sub dump
    #---------------------------------------------------------------------------#
 {
    my $buffer = shift @_;
+   my $type   = shift @_;
    my $fh     = shift @_;
 
    my $i      = 0;
@@ -427,36 +447,43 @@ sub dump
    my $lspec  = $len>0xFFFFFF ? '%8.8lX' : $len>0xFFFF ? '%6.6lX' : '%4.4lX';
    my @ldata;
    my $adata;
+   my $edata;
+   my $sdata;
 
    my @result;
 
    while ($i+16 <= $len) {
       $adata = substr ($buffer, $i, 16);
+      eval '($edata = $adata) =~ tr/'.$cp_037.'/\x00-\xFF/';
+      $edata =~ tr/\x00-\x1F\x7F-\xFF/./;
       @ldata = unpack ('N4', $adata);
       $adata =~ tr/\x00-\x1F\x7F-\xFF/./;
+      $sdata = sprintf "$lspec |%8.8lX %8.8lX %8.8lX %8.8lX|*|%s|",
+                       $i, @ldata, $adata;
+      $sdata .= "$edata|" if $type eq 'ebcdic';
       if ($fh) {
-         printf $fh "$lspec |%8.8lX %8.8lX %8.8lX %8.8lX|*|%s|\n",
-                    $i, @ldata, $adata;
+         print $fh $sdata, "\n";
       } else {
-         push (@result, sprintf "%4.4lX |%8.8lX %8.8lX %8.8lX %8.8lX|*|%s|",
-                        $i, @ldata, $adata);
+         push (@result, $sdata);
       }
       $i += 16;
    }
 
    if ($i < $len) {
       $adata = substr ($buffer, $i);
+      eval '($edata = $adata) =~ tr/'.$cp_037.'/\x00-\xFF/';
+      $edata =~ tr/\x00-\x1F\x7F-\xFF/./;
       @ldata = unpack ('C*', $adata);
       grep (($_ = sprintf ('%2.2X', $_)) && 0, @ldata);
       push (@ldata, split (':', '  ' . (':  ' x (15 - $len + $i))));
       $adata =~ tr/\x00-\x1F\x7F-\xFF/./;
+      $sdata = sprintf "$lspec |%s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s|*|%s|",
+                       $i, @ldata, pack ('A16', $adata);
+      $sdata .= pack ('A16', $edata).'|' if $type eq 'ebcdic';
       if ($fh) {
-         printf $fh "$lspec |%s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s|*|%s|\n",
-                    $i, @ldata, pack ('A16', $adata);
+         printf $fh $sdata, "\n";
       } else {
-         push (@result,
-               sprintf "$lspec |%s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s|*|%s|",
-                       $i, @ldata, pack ('A16', $adata));
+         push (@result, $sdata);
       }
    }
    return @result;
@@ -3123,7 +3150,7 @@ sub out_file
                                            @keys]);
       }
    } elsif ($output->{form} eq 'dump') {
-      push @obuf, &dump ($ibuf);
+      push @obuf, &dump ($ibuf, $output->{'dump.type'});
    } elsif ($output->{form} eq 'b64') {
       if (!$output->{'b64.type'}) {
          my $asn      = &asn_parse (\$ibuf, \$offset, length ($ibuf));
@@ -3216,7 +3243,7 @@ file:    All file names may carry an optional [suboptions] suffix.  Valid
             b64                base64 encode the output
             hex                encode to hex
             bin                create a new binary file
-            dump               format a dump report in hex and ascii
+            dump[:ebcdic]      format a dump report in hex, ascii [and ebcdic]
             asn[:type][,mode]  asn dump (with "type" tags or autotype)
                                use ,1 to list fields for input selectors
          Use - as a filename to supply options for STDIN or STDOUT.
