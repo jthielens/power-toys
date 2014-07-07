@@ -5,6 +5,7 @@
 $VERSION = <<"";
 Version Description                        Date   Who
 ------- ---------------------------------- ------ ---
+1.2.17  -out [bin:ebcdic and ascii]        140422 jbt
 1.2.16  dump:ebcdic                        140417 jbt
 1.2.15  remove HTML::Entities dependency   140314 jbt
 1.2.14  cleanup some modern perl warnings  140313 jbt
@@ -3173,6 +3174,11 @@ sub out_file
    } elsif ($output->{form} eq 'HEX') {
       push @obuf, uc &encode_hex ($ibuf);
    } else {  #  ($output->{form} eq 'bin')
+      if ($output->{'bin.type'} eq 'ebcdic') {
+         eval '$ibuf =~ tr/\x00-\xFF/'.$cp_037.'/';
+      } elsif ($output->{'bin.type'} eq 'ascii') {
+         eval '$ibuf =~ tr/'.$cp_037.'/\x00-\xFF/';
+      }
       push @obuf, $ibuf;
    }
 
@@ -3242,7 +3248,7 @@ file:    All file names may carry an optional [suboptions] suffix.  Valid
          Valid suboptions on the output file are:
             b64                base64 encode the output
             hex                encode to hex
-            bin                create a new binary file
+            bin[:ebcdic|ascii] raw binary output [translating to|from ebcdic]
             dump[:ebcdic]      format a dump report in hex, ascii [and ebcdic]
             asn[:type][,mode]  asn dump (with "type" tags or autotype)
                                use ,1 to list fields for input selectors
