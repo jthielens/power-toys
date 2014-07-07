@@ -301,6 +301,7 @@ sub tty_width
 {
    my $stty = `stty -a 2>/dev/null`;
    return $1 if $stty =~ /columns\s*=?\s*(\d+)/;
+   return $1 if $stty =~ /(\d+)\s*=?\s*(columns)/;
    return 80;
 }
 
